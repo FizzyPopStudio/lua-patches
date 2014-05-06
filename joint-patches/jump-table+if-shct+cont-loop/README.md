@@ -55,7 +55,7 @@ The `switch/case` statement has the following syntax:
 
 The `else` block is optional, but if present must be the last block in the `switch` statement.
 
-The `and break` modifier automatically places a `break` statement at the end of every `case` block. The default is `and continue`, which is also the default in most implementations of the `switch/case` expression. You may also use the `break` statement anywhere in the `case` block to jump to the end of the entire `switch` statement. Additionally, the `continue` keyword may be used in a `case` block to jump execution immediately to the next `case` block.
+The `and break` modifier automatically places a `break` statement at the end of every `case` block. The default is `and continue`, which is typical for `switch/case` in languages derived from C or influenced by Fortran's computed goto. You may also use the `break` statement anywhere in the `case` block to jump to the end of the entire `switch` statement. Additionally, the `continue` keyword may be used in a `case` block to jump execution immediately to the next `case` block.
 
 You may nest `switch/case` statements and you may also use `jumpto` inside case blocks; as each case is a new block there will be no conflicts with case values and jump labels. See the `jumpto.lua` test file (added by the tests patch file) for some examples of nested `switch/case` and `jumpto` statements.
 
