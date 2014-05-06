@@ -113,4 +113,4 @@ The good news is that a link to the test suite was posted on the mailing list: [
 
 [**Lua-L Mailing List**](http://www.lua.org/lua-l.html): Thank you to all members of the Lua-L mailing list who provide thought provoking discussion about Lua on an almost daily basis.
 
-[**Power Patches Wiki Page**](http://lua-users.org/wiki/LuaPowerPatches/): Thank you to all the developers who posted their power patches for others to use and learn from.
+[**Power Patches Wiki Page**](http://lua-users.org/wiki/LuaPowerPatches): Thank you to all the developers who posted their power patches for others to use and learn from.
