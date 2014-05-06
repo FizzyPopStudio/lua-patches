@@ -1,0 +1,1871 @@
+================================================================================
+ Patch: Jump Tables + Switch Case + Jumpto + If Shortcut + Continue Loops
+Source: Lua 5.3 work 2
+  Date: 2014-05-04 (Sun 04 May 2014)
+Author: Paige Marie DePol [FizzyPop Studios]
+Online: http://lunia.fizzypopstudios.com
+
+Adds block level jump tables to prototypes; jump point locations are indexed
+in the block jump table with jump conditions as keys and PC offsets as values.
+Adds the standard switch/case/else statement which uses a jump table to quickly
+determine which case block to jump to. Includes modifiers to automatically add
+a `break` statement at the end of each case. Also includes a new `continue`
+keyword which allows the code to jump to the next case block on demand.
+Adds computed goto (jumpto) to allow code branching based on constant values.
+Adds jumpto labels (:|...|:) which can be almost any constant value, sorry no
+NaN or -0.0. Ambiguous strings and strings with spaces must be quoted to be
+recognised as a string;  :|"42"|:  :|"nil"|:  :|"1.25"|:  :|"meow mix"|:
+
+~~~~~~~~~~~~ THE FOLLOWING PATCHES HAVE BEEN MERGED INTO THIS PATCH ~~~~~~~~~~~~
+ Patch: If Shortcut Statement
+Added shortcut IF statements for jumpto/goto/break/continue/return statements
+You may now enter one of the previous statements instead of `then` after `if`
+When this shortcut is used you may not use `else`, and no `end` is required.
+
+ Patch: Continue Loop Control
+Added new `continue` statement in loop contexts to allow continuation of next
+loop cycle by jumping to the end of the current syntax block, but not out of it.
+================================================================================
+--- Lua-5.3w2/src/ldo.c	
++++ Lunia-1.0/src/ldo.c	
+@@ -668,12 +668,14 @@
+   L->nny++;  /* cannot yield during parsing */
+   p.z = z; p.name = name; p.mode = mode;
+   p.dyd.actvar.arr = NULL; p.dyd.actvar.size = 0;
++  p.dyd.jt.arr = NULL; p.dyd.jt.size = 0;
+   p.dyd.gt.arr = NULL; p.dyd.gt.size = 0;
+   p.dyd.label.arr = NULL; p.dyd.label.size = 0;
+   luaZ_initbuffer(L, &p.buff);
+   status = luaD_pcall(L, f_parser, &p, savestack(L, L->top), L->errfunc);
+   luaZ_freebuffer(L, &p.buff);
+   luaM_freearray(L, p.dyd.actvar.arr, p.dyd.actvar.size);
++  luaM_freearray(L, p.dyd.jt.arr, p.dyd.jt.size);
+   luaM_freearray(L, p.dyd.gt.arr, p.dyd.gt.size);
+   luaM_freearray(L, p.dyd.label.arr, p.dyd.label.size);
+   L->nny--;
+================================================================================
+--- Lua-5.3w2/src/ldump.c	
++++ Lunia-1.0/src/ldump.c	
+@@ -91,6 +91,35 @@
+ 
+ static void DumpFunction(const Proto *f, DumpState *D);
+ 
++static void DumpJumpTables (const Proto* f, DumpState* D)
++{
++  int n = f->sizejt;  /* number of jump tables */
++  int i, k;
++  TValue key[2];  /* need two for luaH_next */
++  TValue toint;
++  DumpInt(n, D);  /* dump number of jump table entries */
++  if (n == 0) return;
++  for (i = 0; i < n; i++) {  /* dump each jump table */
++    setnilvalue(&key[0]);
++    while (luaH_next(D->L, f->jt[i].table, key)) {
++      if (ttistable(&key[0])) {
++        setnilvalue(&toint);
++        k = luaU_constnumber(D->L, f, &toint);  /* get nil constant */
++      } else if (ttislightuserdata(&key[0])) {
++        setivalue(&toint, cast_integer(pvalue(&key[0])));
++        k = luaU_constnumber(D->L, f, &toint);  /* get integer constant */
++      } else {
++        k = luaU_constnumber(D->L, f, &key[0]);  /* get other constant */
++      }
++      lua_assert(k > -1);  /* sanity check to ensure constant was in list */
++      DumpInt(cast(int, ivalue(&key[1])), D);  /* write out jump point */
++      DumpInt(k, D);  /* write out constant number */
++    }
++    DumpInt(-1, D);  /* end of table marker */
++  }
++}
++
++
+ static void DumpConstants (const Proto *f, DumpState *D) {
+   int i;
+   int n = f->sizek;
+@@ -152,6 +181,12 @@
+   DumpInt(n, D);
+   for (i = 0; i < n; i++)
+     DumpString(f->upvalues[i].name, D);
++  n = (D->strip) ? 0 : f->sizejt;
++  DumpInt(n, D);
++  for (i = 0; i < n; i++) {
++    DumpInt(f->jt[i].startpc, D);
++    DumpInt(f->jt[i].endpc, D);
++  }
+ }
+ 
+ 
+@@ -164,6 +199,7 @@
+   DumpCode(f, D);
+   DumpConstants(f, D);
+   DumpUpvalues(f, D);
++  DumpJumpTables(f,D);
+   DumpDebug(f, D);
+ }
+ 
+================================================================================
+--- Lua-5.3w2/src/luac.c	
++++ Lunia-1.0/src/luac.c	
+@@ -19,7 +19,7 @@
+ #include "lstate.h"
+ #include "lundump.h"
+ 
+-static void PrintFunction(const Proto* f, int full);
++static void PrintFunction(lua_State *L, const Proto* f, int full);
+ #define luaU_print	PrintFunction
+ 
+ #define PROGNAME	"luac"		/* default program name */
+@@ -32,6 +32,15 @@
+ static const char* output=Output;	/* actual output file name */
+ static const char* progname=PROGNAME;	/* actual program name */
+ 
++typedef struct JumpPoints {
++  int *keys;  /* jump point labels (as constant number) */
++  int *vals;  /* jump point offsets */
++  int count;  /* number of entries */
++  int last;   /* last seen jump point (for 'assembly' listing) */
++  int elsepc;  /* pc of `else' block or end of `switch/case' block */
++  int endpc;  /* pc of end of `switch/case' block */
++} JumpPoints;
++
+ static void fatal(const char* message)
+ {
+  fprintf(stderr,"%s: %s\n",progname,message);
+@@ -172,7 +181,7 @@
+   if (luaL_loadfile(L,filename)!=LUA_OK) fatal(lua_tostring(L,-1));
+  }
+  f=combine(L,argc);
+- if (listing) luaU_print(f,listing>1);
++ if (listing) luaU_print(L,f,listing>1);
+  if (dumping)
+  {
+   FILE* D= (output==NULL) ? stdout : fopen(output,"wb");
+@@ -252,8 +261,9 @@
+ 
+ static void PrintConstant(const Proto* f, int i)
+ {
+- const TValue* o=&f->k[i];
+- switch (ttypenv(o))
++ int noquote = (i < 0);
++ const TValue* o=&f->k[noquote ? -(i + 1) : i];
++ switch (ttnov(o))
+  {
+   case LUA_TNIL:
+ 	printf("nil");
+@@ -264,8 +274,21 @@
+   case LUA_TNUMBER:
+ 	printf(LUA_NUMBER_FMT,nvalue(o));
+ 	break;
+-  case LUA_TSTRING:
+-	PrintString(rawtsvalue(o));
++  case LUA_TSTRING: {
++  /* if no quote was requested override if string matches the following; */
++  /* looks like a number, contains a space character, or is ambiguous */
++  lua_Number n = lua_str2number(svalue(o), NULL);
++  if (noquote && ( n > 0.0 || (n == 0.0 && !strncmp(svalue(o), "0", 1))
++                           || strchr(svalue(o), ' ')
++                           || !strncmp(svalue(o), "nil", 3)
++                           || !strncmp(svalue(o), "true", 4)
++                           || !strncmp(svalue(o), "false", 5)))
++    noquote = 0;  /* override, must show quotes */
++  if (noquote)
++    printf("%s", getstr(rawtsvalue(o)));
++  else
++    PrintString(rawtsvalue(o));
++  }
+ 	break;
+   default:				/* cannot happen */
+ 	printf("? type=%d",ttype(o));
+@@ -273,13 +296,92 @@
+  }
+ }
+ 
++static void LoadJumpPoints(lua_State *L, const Proto *f, JumpPoints* jp)
++{
++  TValue key[2];  /* need two as luaH_next writes value to key+1 */
++  TValue toint;
++  int i, j, k;
++  if (f->sizejt == 0) return;
++  for (i = 0; i < f->sizejt; i++) {
++    jp[i].keys = NULL;
++    jp[i].vals = NULL;
++    jp[i].count = 0;
++    jp[i].last = 0;
++    jp[i].elsepc = -1;
++    jp[i].endpc = f->jt[i].endpc;
++    setnilvalue(&key[0]);
++    while (luaH_next(L, f->jt[i].table, &key[0])) {
++      jp[i].count++;
++      jp[i].keys = G(L)->frealloc(0, jp[i].keys, 0, sizeof(int) * jp[i].count);
++      jp[i].vals = G(L)->frealloc(0, jp[i].vals, 0, sizeof(int) * jp[i].count);
++      for (k = 0; k < jp[i].count - 1; k++)
++        if (jp[i].vals[k] > cast(int, ivalue(&key[1]))) break;
++      if (jp[i].count > 1) {
++        for (j = jp[i].count - 1; j > k; j--) {
++          jp[i].keys[j] = jp[i].keys[j - 1];
++          jp[i].vals[j] = jp[i].vals[j - 1];
++        }
++      }
++      if (ttistable(&key[0])) {
++        setnilvalue(&toint);
++        jp[i].keys[k] = luaU_constnumber(L, f, &toint);
++      } else if (ttislightuserdata(&key[0])) {
++        setivalue(&toint, cast_integer(pvalue(&key[0])));
++        jp[i].keys[k] = luaU_constnumber(L, f, &toint);
++      } else
++        jp[i].keys[k] = luaU_constnumber(L, f, &key[0]);
++      jp[i].vals[k] = cast(int, ivalue(&key[1]));
++    }
++  }
++}
++
++static void FreeJumpPoints(lua_State *L, const Proto *f, JumpPoints *jp)
++{
++  int i;
++  if (f->sizejt == 0) return;
++  for (i = 0; i < f->sizejt; i++) {
++    G(L)->frealloc(0, jp[i].keys, 0, 0);
++    G(L)->frealloc(0, jp[i].vals, 0, 0);
++  }
++  free(jp);
++}
++
++static void PrintJumpPoints(lua_State *L, const Proto *f, const JumpPoints *jp)
++{
++  int i, k, sl, el;
++  if (f->sizejt == 0) return;
++  for (i = 0; i < f->sizejt; i++) {
++    sl = getfuncline(f, f->jt[i].startpc);
++    el = getfuncline(f, f->jt[i].endpc);
++    printf("#%d\t(%d-%d)\t[%d-%d]\n", i + 1, f->jt[i].startpc + 1,
++                                      f->jt[i].endpc + 1, sl, el);
++    for (k = 0; k < jp[i].count; k++) {
++      printf("\t%d\t", jp[i].vals[k]);
++      printf("%d\t", jp[i].keys[k] + 1);
++      PrintConstant(f, jp[i].keys[k]);
++      printf("\n");
++    }
++  }
++}
++
++static int JumpTableForPC(const Proto* f, int pc)
++{
++  int i;
++  for (i = f->sizejt - 1; i > -1; i--)
++    if (pc >= f->jt[i].startpc && pc <= f->jt[i].endpc)
++      return i;
++  return -1;
++}
++
+ #define UPVALNAME(x) ((f->upvalues[x].name) ? getstr(f->upvalues[x].name) : "-")
+ #define MYK(x)		(-1-(x))
+ 
+-static void PrintCode(const Proto* f)
++static void PrintCode(const Proto* f, JumpPoints *jp)
+ {
+  const Instruction* code=f->code;
+  int pc,n=f->sizecode;
++ int jtnum = -1;
++ int swcs = 0;  /* is switch/case op_jmptbl */
+  for (pc=0; pc<n; pc++)
+  {
+   Instruction i=code[pc];
+@@ -291,6 +393,8 @@
+   int bx=GETARG_Bx(i);
+   int sbx=GETARG_sBx(i);
+   int line=getfuncline(f,pc);
++  jtnum=JumpTableForPC(f,pc);
++  swcs=jp[jtnum].elsepc > -1;
+   printf("\t%d\t",pc+1);
+   if (line>0) printf("[%d]\t",line); else printf("[-]\t");
+   printf("%-9s\t",luaP_opnames[o]);
+@@ -352,6 +456,13 @@
+      if (ISK(c)) PrintConstant(f,INDEXK(c)); else printf("-");
+     }
+     break;
++   case OP_JMPTBL:
++    jp[jtnum].elsepc = c == 0 ? GETARG_sBx(code[pc + 1]) + pc + 2 : -1;
++    if (c == 0)
++      printf("\t; switch/case  (#%d)", b + 1);
++    else
++      printf("\t; jumpto  (#%d)", b + 1);
++    break;
+    case OP_JMP:
+    case OP_FORLOOP:
+    case OP_FORPREP:
+@@ -370,6 +481,50 @@
+    default:
+     break;
+   }
++  if (jtnum > -1) {
++    if (jp[jtnum].elsepc == pc) {
++      int curr = jtnum;
++      printf("\t; ");
++      if (jp[jtnum].elsepc != jp[jtnum].endpc) {
++        printf("else block  (#%d)", jtnum + 1);
++        jp[jtnum].elsepc = jp[jtnum].endpc;
++      } else {
++        printf("end switch  (#%d", jtnum + 1);
++        jp[jtnum].elsepc = -1;
++        while (--curr > -1) {  /* multiple switch/case end at same PC? */
++          if (jp[curr].endpc == pc)
++            printf(",%d", curr + 1);
++        }
++        printf(")");
++      }
++    } else {
++      int last = jp[jtnum].last;
++      if (jp[jtnum].vals[last] == pc) {
++        int curr = last;
++        printf("\t; ");
++        if (swcs) {
++          printf("case ");
++          while (jp[jtnum].vals[curr] == pc) {  /* multiple case at same PC? */
++            PrintConstant(f, jp[jtnum].keys[curr]);
++            curr++;
++            if (jp[jtnum].vals[curr] == pc)
++              printf("|");
++          }
++          printf("  (#%d)", jtnum + 1);
++        } else {
++          printf(":|");
++          while (jp[jtnum].vals[curr] == pc) {  /* multiple jumpto same PC? */
++            PrintConstant(f, -(jp[jtnum].keys[curr] + 1));
++            curr++;
++            if (jp[jtnum].vals[curr] == pc)
++              printf("|");
++          }
++          printf("|:  (#%d)", jtnum + 1);
++        }
++        jp[jtnum].last += curr - last;
++      }
++    }
++  }
+   printf("\n");
+  }
+ }
+@@ -393,11 +548,11 @@
+  printf("%d%s param%s, %d slot%s, %d upvalue%s, ",
+ 	(int)(f->numparams),f->is_vararg?"+":"",SS(f->numparams),
+ 	S(f->maxstacksize),S(f->sizeupvalues));
+- printf("%d local%s, %d constant%s, %d function%s\n",
+-	S(f->sizelocvars),S(f->sizek),S(f->sizep));
++ printf("%d local%s, %d constant%s, %d jump table%s, %d function%s\n",
++	S(f->sizelocvars),S(f->sizek),S(f->sizejt),S(f->sizep));
+ }
+ 
+-static void PrintDebug(const Proto* f)
++static void PrintDebug(lua_State *L, const Proto* f, JumpPoints *jp)
+ {
+  int i,n;
+  n=f->sizek;
+@@ -408,6 +563,11 @@
+   PrintConstant(f,i);
+   printf("\n");
+  }
++ n=f->sizejt;
++ printf("jump tables (%d) for %p:\n",n,VOID(f));
++ if (n > 0) {
++  PrintJumpPoints(L, f, jp);
++ }
+  n=f->sizelocvars;
+  printf("locals (%d) for %p:\n",n,VOID(f));
+  for (i=0; i<n; i++)
+@@ -424,11 +584,17 @@
+  }
+ }
+ 
+-static void PrintFunction(const Proto* f, int full)
++static void PrintFunction(lua_State *L, const Proto* f, int full)
+ {
+- int i,n=f->sizep;
++ int i,n=f->sizejt + 1;  /* we need an extra one for tracking else clause */
++ JumpPoints *jp = G(L)->frealloc(0, NULL, 0, n ? sizeof(JumpPoints) * n : 0);
+  PrintHeader(f);
+- PrintCode(f);
+- if (full) PrintDebug(f);
+- for (i=0; i<n; i++) PrintFunction(f->p[i],full);
++ LoadJumpPoints(L, f, jp);
++ PrintCode(f, jp);
++ if (full) PrintDebug(L,f,jp);
++ FreeJumpPoints(L, f, jp);
++ n=f->sizep;
++ for (i=0; i<n; i++) {
++  PrintFunction(L,f->p[i],full);
++ }
+ }
+================================================================================
+--- Lua-5.3w2/src/lundump.c	
++++ Lunia-1.0/src/lundump.c	
+@@ -19,6 +19,8 @@
+ #include "lstring.h"
+ #include "lundump.h"
+ #include "lzio.h"
++#include "ltable.h"
++#include "lvm.h"
+ 
+ 
+ #if !defined(luai_verifycode)
+@@ -41,6 +43,20 @@
+ 
+ 
+ /*
++** Scan constant table and return the number of constant `k'
++** Returns -1 if the constant was not found in the table
++*/
++LUAI_FUNC int luaU_constnumber (lua_State* L, const Proto* f, TValue* k)
++{
++  int i;
++  for (i = 0; i < f->sizek; i++)
++    if (luaV_rawequalobj(&f->k[i], k))
++      return i;
++  return -1;
++}
++
++
++/*
+ ** All high-level loads go through LoadVector; you can change it to
+ ** adapt to the endianess of the input
+ */
+@@ -108,6 +124,40 @@
+ static void LoadFunction(LoadState *S, Proto *f);
+ 
+ 
++static void LoadJumpTable(LoadState* S, Proto* f)
++{
++  int n, i, k, v;
++  TValue key;
++  n = LoadInt(S);  /* number of jump tables */
++  if (n == 0) return;
++  f->jt = luaM_newvector(S->L, n, JumpTable);
++  f->sizejt = n;
++  for (i = 0; i < n; i++) {  /* load jump tables */
++    f->jt[i].table = luaH_new(S->L);
++    f->jt[i].startpc = -1;  /* real values will be loaded in LoadDebug */
++    f->jt[i].endpc = -1;    /* unless the binary file was stripped */
++    do {
++      v = LoadInt(S);  /* load jumpto 'pc' position */
++      if (v > -1) {  /* check if end of table marker, if not load... */
++        k = LoadInt(S);  /* ...constant number and set in the jump table */
++        if (ttisnil(&f->k[k])) {
++          sethvalue(S->L, &key, f->jt[0].table);
++        } else if (ttisinteger(&f->k[k])) {
++          setpvalue(&key, cast(void*, cast(size_t, ivalue(&f->k[k]))));
++        } else if (ttisfloat(&f->k[k])) {
++          setnvalue(&key, fltvalue(&f->k[k]));
++        } else if (ttisboolean(&f->k[k])) {
++          setbvalue(&key, bvalue(&f->k[k]));
++        } else {
++          setsvalue(S->L, &key, rawtsvalue(&f->k[k]));
++        }
++        setivalue(luaH_set(S->L, f->jt[i].table, &key), v);
++      }
++    } while (v > -1);  /* loop until end of table marker */
++  }
++}
++
++
+ static void LoadConstants (LoadState *S, Proto *f) {
+   int i, n;
+   n = LoadInt(S);
+@@ -185,6 +235,11 @@
+   n = LoadInt(S);
+   for (i = 0; i < n; i++)
+     f->upvalues[i].name = LoadString(S);
++  n = LoadInt(S);
++  for (i = 0; i < n; i++) {
++    f->jt[i].startpc = LoadInt(S);
++    f->jt[i].endpc = LoadInt(S);
++  }
+ }
+ 
+ 
+@@ -197,6 +252,7 @@
+   LoadCode(S, f);
+   LoadConstants(S, f);
+   LoadUpvalues(S, f);
++  LoadJumpTable(S,f);
+   LoadDebug(S, f);
+ }
+ 
+================================================================================
+--- Lua-5.3w2/src/lundump.h	
++++ Lunia-1.0/src/lundump.h	
+@@ -22,6 +22,9 @@
+ #define LUAC_VERSION	(MYINT(LUA_VERSION_MAJOR)*16+MYINT(LUA_VERSION_MINOR))
+ #define LUAC_FORMAT	0	/* this is the official format */
+ 
++/* get constant number from prototype */
++LUAI_FUNC int luaU_constnumber (lua_State* L, const Proto* f, TValue* k);
++
+ /* load one chunk; from lundump.c */
+ LUAI_FUNC Closure* luaU_undump (lua_State* L, ZIO* Z, Mbuffer* buff,
+                                 const char* name);
+================================================================================
+--- Lua-5.3w2/src/lvm.c	
++++ Lunia-1.0/src/lvm.c	
+@@ -26,6 +26,7 @@
+ #include "ltable.h"
+ #include "ltm.h"
+ #include "lvm.h"
++#include "lcode.h"
+ 
+ 
+ 
+@@ -63,6 +64,38 @@
+ 
+ 
+ /*
++** convert the jumpto label `obj' (in stack) into string for error messages
++** this will quote strings with spaces or strings that look like numbers
++** it will also convert `nil' and boolean to string values as well
++*/
++const char *luaV_jtlabel (lua_State *L, StkId obj) {
++  if (ttisnil(obj)) {
++    setsvalue2s(L, obj, luaS_newliteral(L, "nil"));
++  } else if (ttisboolean(obj)) {
++    if (bvalue(obj) == 1) {
++      setsvalue2s(L, obj, luaS_newliteral(L, "true"));
++    } else {
++      setsvalue2s(L, obj, luaS_newliteral(L, "false"));
++    }
++  } else if (!ttisstring(obj)) {
++    setobj2s(L, L->top - 1, obj);
++    luaV_tostring(L, obj);
++  } else {
++    lua_Number n = lua_str2number(svalue(obj), NULL);
++    if (n > 0.0 || (n == 0.0 && !strncmp(svalue(obj), "0", 1))
++                || strchr(svalue(obj), ' ')
++                || !strncmp(svalue(obj), "nil", 3)
++                || !strncmp(svalue(obj), "true", 4)
++                || !strncmp(svalue(obj), "false", 5)) {
++      luaO_pushfstring(L, "\"%s\"", svalue(obj));
++      setobj2s(L, obj, L->top - 1);
++    }
++  }
++  return svalue(obj);
++}
++
++
++/*
+ ** Check whether a float number is within the range of a lua_Integer.
+ ** (The comparisons are tricky because of rounding, which can or
+ ** not occur depending on the relative sizes of floats and integers.)
+@@ -496,6 +529,58 @@
+ }
+ 
+ 
++/*
++** Check for jump point 'ra' in jump table number 'b', if entry exists
++** then offset 'pc' by the value in the jump table and continue execution.
++** The current program counter is passed in as the 'pc' parameter.
++** If 'c == 0' then OP_JMPTBL was called as a switch/case statement.
++** If 'c <= 1' then no errors will be thrown and execution will continue.
++** If 'c >= 2' then throw an error if the jump point does not exist.
++*/
++void luaV_jumptable (lua_State *L, StkId ra, int b, int c, int pc) {
++  CallInfo *ci = L->ci;
++  Proto *p = clLvalue(ci->func)->p;
++  const TValue *pcv = NULL;
++  const char *err = NULL;
++  int jtpc;
++  if (p->jt == NULL || b > p->sizejt || p->jt[b].table == NULL)
++    luaG_runerror(L, "no jump tables defined for closure");  /* sanity check */
++  if (ttisnil(ra)) {  /* check if ra is nil */
++      TValue k;
++      sethvalue(L, &k, p->jt[0].table);  /* use first table as nil key */
++      pcv = luaH_get(p->jt[b].table, &k);
++  } else if (ttisinteger(ra)) {
++    TValue k;  /* use integer specific key for lookup */
++    setpvalue(&k, cast(void*, cast(size_t, ivalue(ra))));
++    pcv = luaH_get(p->jt[b].table, &k);
++  } else if (ttisfloat(ra)) {  /* check if ra is a float */
++    lua_Number n = fltvalue(ra);
++    lua_Integer i;
++    if (luai_numisnan(n) || isminuszero(n)) {  /* check if nan or -0.0 */
++      err = "attempt to use NaN or -0.0 as jump value";
++      pcv = luaO_nilobject;
++    } else if (numisinteger(n, &i)) {  /* check if float is integral value */
++      TValue k;
++      setpvalue(&k, cast(void*, cast(size_t, i)));
++      pcv = luaH_get(p->jt[b].table, &k);
++    }
++  }
++  if (pcv == NULL)  /* if pcv not set above try setting now */
++    pcv = luaH_get(p->jt[b].table, ra);
++  if (ttisnil(pcv)) {
++    if (c > 1) {  /* if c > 1 then throw error if not found */
++      if (err != NULL)
++        luaG_runerror(L, err);
++      else {
++        luaV_jtlabel(L, ra);
++        luaG_runerror(L, "no jump point for <jumpto %s>", svalue(ra));
++      }
++    }
++  } else {
++    jtpc = cast(int, ivalue(pcv));  /* get jump point offset */
++    ci->u.l.savedpc += jtpc - pc - 1;  /* adjust pc by jumpto offset */
++  }
++}
+ 
+ /*
+ ** some macros for common tasks in `luaV_execute'
+@@ -796,6 +881,10 @@
+         checkGC(L, (ra >= rb ? ra + 1 : rb));
+         L->top = ci->top;  /* restore top */
+       )
++      vmcase(OP_JMPTBL,
++        Protect(luaV_jumptable(L, ra, GETARG_B(i), GETARG_C(i),
++                       pcRel(ci->u.l.savedpc, ci_func(ci)->p)));
++      )
+       vmcase(OP_JMP,
+         dojump(ci, i, 0);
+       )
+================================================================================
+--- Lua-5.3w2/src/ltable.c	
++++ Lunia-1.0/src/ltable.c	
+@@ -67,12 +67,6 @@
+ #define hashpointer(t,p)	hashmod(t, IntPoint(p))
+ 
+ 
+-/* checks whether a float has a value representable as a lua_Integer
+-   (and does the conversion if so) */
+-#define numisinteger(x,i) \
+-	(((x) == l_floor(x)) && luaV_numtointeger(x, i))
+-
+-
+ #define dummynode		(&dummynode_)
+ 
+ #define isdummy(n)		((n) == dummynode)
+================================================================================
+--- Lua-5.3w2/src/lvm.h	
++++ Lunia-1.0/src/lvm.h	
+@@ -26,6 +26,10 @@
+ 
+ #define luaV_rawequalobj(t1,t2)		luaV_equalobj(NULL,t1,t2)
+ 
++/* checks whether a float has a value representable as a lua_Integer
++   (and does the conversion if so) */
++#define numisinteger(x,i) \
++	(((x) == l_floor(x)) && luaV_numtointeger(x, i))
+ 
+ LUAI_FUNC int luaV_equalobj (lua_State *L, const TValue *t1, const TValue *t2);
+ LUAI_FUNC int luaV_lessthan (lua_State *L, const TValue *l, const TValue *r);
+================================================================================
+--- Lua-5.3w2/src/llex.c	
++++ Lunia-1.0/src/llex.c	
+@@ -38,9 +38,10 @@
+     "and", "break", "do", "else", "elseif",
+     "end", "false", "for", "function", "goto", "if",
+     "in", "local", "nil", "not", "or", "repeat",
++    "switch", "case", "jumpto", "on", "ignore", "continue",
+     "return", "then", "true", "until", "while",
+     "//", "..", "...", "==", ">=", "<=", "~=",
+-    "<<", ">>", "::", "<eof>",
++    "<<", ">>", ":|", "|:", "::", "<eof>",
+     "<number>", "<number>", "<name>", "<string>"
+ };
+ 
+@@ -515,9 +516,15 @@
+       }
+       case ':': {
+         next(ls);
+-        if (ls->current != ':') return ':';
+-        else { next(ls); return TK_DBCOLON; }
++        if (ls->current == '|') { next(ls); return TK_JTOPEN; }
++        else if (ls->current == ':') { next(ls); return TK_DBCOLON; }
++        else { return ':'; }
+       }
++      case '|': {
++        next(ls);
++        if (ls->current != ':') return '|';
++        else { next(ls); return TK_JTCLOSE; }
++      }
+       case '"': case '\'': {  /* short literal strings */
+         read_string(ls, ls->current, seminfo);
+         return TK_STRING;
+================================================================================
+--- Lua-5.3w2/src/lgc.c	
++++ Lunia-1.0/src/lgc.c	
+@@ -457,11 +457,14 @@
+     markobject(g, f->p[i]);
+   for (i = 0; i < f->sizelocvars; i++)  /* mark local-variable names */
+     markobject(g, f->locvars[i].varname);
++  for (i = 0; i < f->sizejt; i++)  /* mark jump tables */
++    markobject(g, f->jt[i].table);
+   return sizeof(Proto) + sizeof(Instruction) * f->sizecode +
+                          sizeof(Proto *) * f->sizep +
+                          sizeof(TValue) * f->sizek +
+                          sizeof(int) * f->sizelineinfo +
+                          sizeof(LocVar) * f->sizelocvars +
++                         sizeof(JumpTable) * f->sizejt +
+                          sizeof(Upvaldesc) * f->sizeupvalues;
+ }
+ 
+================================================================================
+--- Lua-5.3w2/src/lfunc.c	
++++ Lunia-1.0/src/lfunc.c	
+@@ -96,6 +96,8 @@
+   Proto *f = &luaC_newobj(L, LUA_TPROTO, sizeof(Proto))->p;
+   f->k = NULL;
+   f->sizek = 0;
++  f->jt = NULL;
++  f->sizejt = 0;
+   f->p = NULL;
+   f->sizep = 0;
+   f->code = NULL;
+@@ -119,6 +121,7 @@
+ 
+ void luaF_freeproto (lua_State *L, Proto *f) {
+   luaM_freearray(L, f->code, f->sizecode);
++  luaM_freearray(L, f->jt, f->sizejt);
+   luaM_freearray(L, f->p, f->sizep);
+   luaM_freearray(L, f->k, f->sizek);
+   luaM_freearray(L, f->lineinfo, f->sizelineinfo);
+================================================================================
+--- Lua-5.3w2/src/lopcodes.c	
++++ Lunia-1.0/src/lopcodes.c	
+@@ -45,6 +45,7 @@
+   "NOT",
+   "LEN",
+   "CONCAT",
++  "JMPTBL",
+   "JMP",
+   "EQ",
+   "LT",
+@@ -100,6 +101,7 @@
+  ,opmode(0, 1, OpArgR, OpArgN, iABC)		/* OP_NOT */
+  ,opmode(0, 1, OpArgR, OpArgN, iABC)		/* OP_LEN */
+  ,opmode(0, 1, OpArgR, OpArgR, iABC)		/* OP_CONCAT */
++ ,opmode(0, 0, OpArgU, OpArgU, iABC)		/* OP_JMPTBL */
+  ,opmode(0, 0, OpArgR, OpArgN, iAsBx)		/* OP_JMP */
+  ,opmode(1, 0, OpArgK, OpArgK, iABC)		/* OP_EQ */
+  ,opmode(1, 0, OpArgK, OpArgK, iABC)		/* OP_LT */
+================================================================================
+--- Lua-5.3w2/src/lparser.c	
++++ Lunia-1.0/src/lparser.c	
+@@ -24,6 +24,7 @@
+ #include "lstate.h"
+ #include "lstring.h"
+ #include "ltable.h"
++#include "lvm.h"
+ 
+ 
+ 
+@@ -40,18 +41,10 @@
+ #define eqstr(a,b)	((a) == (b))
+ 
+ 
+-/*
+-** nodes for block list (list of active blocks)
+-*/
+-typedef struct BlockCnt {
+-  struct BlockCnt *previous;  /* chain */
+-  short firstlabel;  /* index of first label in this block */
+-  short firstgoto;  /* index of first pending goto in this block */
+-  lu_byte nactvar;  /* # active locals outside the block */
+-  lu_byte upval;  /* true if some variable in the block is an upvalue */
+-  lu_byte isloop;  /* true if `block' is a loop */
+-} BlockCnt;
++static void addlabel (LexState *ls, const char *name);  /* forward dec. */
+ 
++#define breaklabel(ls)  addlabel(ls,"break")
++#define continuelabel(ls)  addlabel(ls,"continue")
+ 
+ 
+ /*
+@@ -336,12 +329,12 @@
+   FuncState *fs = ls->fs;
+   Labellist *gl = &ls->dyd->gt;
+   Labeldesc *gt = &gl->arr[g];
+-  lua_assert(eqstr(gt->name, label->name));
++  lua_assert(luaV_rawequalobj(&gt->value, &label->value));
+   if (gt->nactvar < label->nactvar) {
+     TString *vname = getlocvar(fs, gt->nactvar)->varname;
+     const char *msg = luaO_pushfstring(ls->L,
+       "<goto %s> at line %d jumps into the scope of local " LUA_QS,
+-      getstr(gt->name), gt->line, getstr(vname));
++      svalue(&gt->value), gt->line, getstr(vname));
+     semerror(ls, msg);
+   }
+   luaK_patchlist(fs, gt->pc, label->pc);
+@@ -362,8 +355,8 @@
+   Labeldesc *gt = &dyd->gt.arr[g];
+   /* check labels in current block for a match */
+   for (i = bl->firstlabel; i < dyd->label.n; i++) {
+-    Labeldesc *lb = &dyd->label.arr[i];
+-    if (eqstr(lb->name, gt->name)) {  /* correct label? */
++    Labeldesc *lb = &dyd->label.arr[i];  /* check label is not jumpto */
++    if (lb->isjt == 0 && luaV_rawequalobj(&lb->value, &gt->value)) {
+       if (gt->nactvar > lb->nactvar &&
+           (bl->upval || dyd->label.n > bl->firstlabel))
+         luaK_patchclose(ls->fs, gt->pc, lb->nactvar);
+@@ -375,15 +368,16 @@
+ }
+ 
+ 
+-static int newlabelentry (LexState *ls, Labellist *l, TString *name,
+-                          int line, int pc) {
++static int newlabelentry (LexState *ls, Labellist *l, const TValue *value,
++                                               int line, int pc, int isjt) {
+   int n = l->n;
+   luaM_growvector(ls->L, l->arr, n, l->size,
+                   Labeldesc, SHRT_MAX, "labels/gotos");
+-  l->arr[n].name = name;
++  setobj(ls->L, &l->arr[n].value, value);
+   l->arr[n].line = line;
+   l->arr[n].nactvar = ls->fs->nactvar;
+   l->arr[n].pc = pc;
++  l->arr[n].isjt = cast_byte(isjt);  /* is jumpto label */
+   l->n++;
+   return n;
+ }
+@@ -397,7 +391,7 @@
+   Labellist *gl = &ls->dyd->gt;
+   int i = ls->fs->bl->firstgoto;
+   while (i < gl->n) {
+-    if (eqstr(gl->arr[i].name, lb->name))
++    if (luaV_rawequalobj(&gl->arr[i].value, &lb->value))
+       closegoto(ls, i, lb);
+     else
+       i++;
+@@ -434,35 +428,86 @@
+   bl->nactvar = fs->nactvar;
+   bl->firstlabel = fs->ls->dyd->label.n;
+   bl->firstgoto = fs->ls->dyd->gt.n;
++  bl->firstjumpto = fs->ls->dyd->jt.n;
+   bl->upval = 0;
+   bl->previous = fs->bl;
++  bl->jtnum = 0;
+   fs->bl = bl;
+   lua_assert(fs->freereg == fs->nactvar);
+ }
+ 
+ 
+ /*
+-** create a label named "break" to resolve break statements
+-*/
+-static void breaklabel (LexState *ls) {
+-  TString *n = luaS_new(ls->L, "break");
+-  int l = newlabelentry(ls, &ls->dyd->label, n, 0, ls->fs->pc);
+-  findgotos(ls, &ls->dyd->label.arr[l]);
+-}
+-
+-/*
+ ** generates an error for an undefined 'goto'; choose appropriate
+-** message when label name is a reserved word (which can only be 'break')
++** message when label name is a reserved word ('break' or 'continue')
+ */
+ static l_noret undefgoto (LexState *ls, Labeldesc *gt) {
+-  const char *msg = isreserved(gt->name)
+-                    ? "<%s> at line %d not inside a loop"
++  const char *msg = isreserved(rawtsvalue(&gt->value))
++                    ? "<%s> at line %d not inside a loop or case block"
+                     : "no visible label " LUA_QS " for <goto> at line %d";
+-  msg = luaO_pushfstring(ls->L, msg, getstr(gt->name), gt->line);
++  msg = luaO_pushfstring(ls->L, msg, svalue(&gt->value), gt->line);
+   semerror(ls, msg);
+ }
+ 
+ 
++/*
++** adds a new jump table to the list
++*/
++static void addjumptable (LexState *ls) {
++  lua_State *L = ls->L;
++  FuncState *fs = ls->fs;
++  Proto *f = fs->f;  /* prototype of current function */
++  int oldsize = f->sizejt;
++  if (fs->bl->jtnum > 0) /* check if table already created for block */
++    return;
++  luaM_growvector(L, f->jt, fs->njt, f->sizejt, JumpTable, MAXARG_Bx,
++                                                      "jump tables");
++  while (oldsize < f->sizejt) f->jt[oldsize++].table = NULL;
++  f->jt[fs->njt].table = luaH_new(L);
++  f->jt[fs->njt].startpc = fs->pc;
++  f->jt[fs->njt].endpc = -1;
++  luaC_objbarrier(L, f, f->jt[fs->njt].table);
++  fs->bl->jtnum = ++fs->njt;
++}
++
++
++/*
++** check that all jumpto points in a block do not jump into local scopes
++** and if a block contains jump points check that is has jumpto statements
++*/
++static void checkjumptos(FuncState *fs) {
++  BlockCnt *bl = fs->bl;
++  LexState *ls = fs->ls;
++  int jtnum = ls->dyd->jt.n - bl->firstjumpto;  /* num of jumpto statements */
++  int jpnum = 0;
++  int i, k;
++  const char *msg;
++  TString *vname;
++  for (i = bl->firstlabel; i < ls->dyd->label.n; i++)
++    if (ls->dyd->label.arr[i].isjt) jpnum += 1;
++  if (jtnum > 0 && jpnum == 0)
++    semerror(fs->ls, "block has no jump points for <jumpto> statement");
++  if (jtnum == 0 && jpnum > 0)
++    semerror(fs->ls, "block has no <jumpto> statement for jump points");
++  for (i = bl->firstjumpto; i < ls->dyd->jt.n; i++) {
++    for (k = bl->firstlabel; k < ls->dyd->label.n; k++) {
++      if (ls->dyd->label.arr[k].isjt == 1 &&  /* only check jumpto labels */
++          ls->dyd->jt.arr[i].nactvar < ls->dyd->label.arr[k].nactvar) {
++        lua_unlock(ls->L);
++        luaV_jtlabel(ls->L, ls->L->top++);
++        lua_lock(ls->L);
++        vname = getlocvar(fs, ls->dyd->jt.arr[i].nactvar)->varname;
++        msg = "<jumpto %s> at line %d would jump into scope of local " LUA_QS;
++        msg = luaO_pushfstring(ls->L, msg, svalue(ls->L->top - 1),
++                          ls->dyd->jt.arr[i].line, getstr(vname));
++        semerror(fs->ls, msg);
++      }
++    }
++  }
++  ls->dyd->jt.n -= jtnum;
++}
++
++
+ static void leaveblock (FuncState *fs) {
+   BlockCnt *bl = fs->bl;
+   LexState *ls = fs->ls;
+@@ -474,6 +519,8 @@
+   }
+   if (bl->isloop)
+     breaklabel(ls);  /* close pending breaks */
++  if (bl->jtnum)
++    checkjumptos(fs);  /* check jump label scope */
+   fs->bl = bl->previous;
+   removevars(fs, bl->nactvar);
+   lua_assert(bl->nactvar == fs->nactvar);
+@@ -534,6 +581,7 @@
+   fs->nactvar = 0;
+   fs->firstlocal = ls->dyd->actvar.n;
+   fs->bl = NULL;
++  fs->njt = 0;
+   f = fs->f;
+   f->source = ls->source;
+   f->maxstacksize = 2;  /* registers 0/1 are always valid */
+@@ -553,6 +601,8 @@
+   f->sizelineinfo = fs->pc;
+   luaM_reallocvector(L, f->k, f->sizek, fs->nk, TValue);
+   f->sizek = fs->nk;
++  luaM_reallocvector(L, f->jt, f->sizejt, fs->njt, JumpTable);
++  f->sizejt = fs->njt;
+   luaM_reallocvector(L, f->p, f->sizep, fs->np, Proto *);
+   f->sizep = fs->np;
+   luaM_reallocvector(L, f->locvars, f->sizelocvars, fs->nlocvars, LocVar);
+@@ -1181,27 +1231,36 @@
+ 
+ static void gotostat (LexState *ls, int pc) {
+   int line = ls->linenumber;
+-  TString *label;
++  TValue value;
+   int g;
+-  if (testnext(ls, TK_GOTO))
+-    label = str_checkname(ls);
+-  else {
+-    luaX_next(ls);  /* skip break */
+-    label = luaS_new(ls->L, "break");
++  if (testnext(ls, TK_GOTO)) {
++    setsvalue(ls->L, &value, str_checkname(ls));
++  } else if (testnext(ls, TK_BREAK)) {
++    setsvalue(ls->L, &value, luaX_newstring(ls, "break", 5));
++  } else {  /* must be `continue' */
++    luaX_next(ls);  /* skip TK_CONTINUE */
++    setsvalue(ls->L, &value, luaX_newstring(ls, "continue", 8));
+   }
+-  g = newlabelentry(ls, &ls->dyd->gt, label, line, pc);
++  g = newlabelentry(ls, &ls->dyd->gt, &value, line, pc, 0);
+   findlabel(ls, g);  /* close it if label already defined */
+ }
+ 
+ 
+ /* check for repeated labels on the same block */
+-static void checkrepeated (FuncState *fs, Labellist *ll, TString *label) {
++static void checkrepeated (FuncState *fs, Labellist *ll, TValue *value) {
++  lua_State *L = fs->ls->L;
++  const char *msg;
+   int i;
+   for (i = fs->bl->firstlabel; i < ll->n; i++) {
+-    if (eqstr(label, ll->arr[i].name)) {
+-      const char *msg = luaO_pushfstring(fs->ls->L,
+-                          "label " LUA_QS " already defined on line %d",
+-                          getstr(label), ll->arr[i].line);
++    if (luaV_rawequalobj(value, &ll->arr[i].value)) {
++      lua_unlock(L);
++      setobj(L, L->top++, value);
++      luaV_jtlabel(L, L->top - 1);
++      lua_lock(L);
++      msg = luaO_pushfstring(L,
++                          "label " LUA_QS " already defined for %s on line %d",
++              svalue(fs->ls->L->top -1), (ll->arr[i].isjt ? "jumpto" : "goto"),
++                          ll->arr[i].line);
+       semerror(fs->ls, msg);
+     }
+   }
+@@ -1215,15 +1274,72 @@
+ }
+ 
+ 
++static void coderet (LexState *ls, expdesc *ret, int *start,
++                                        int *count, int *pc) {
++  FuncState *fs = ls->fs;
++  lua_assert(ret != NULL && start != NULL && count != NULL);
++  *count = explist(ls, ret);
++  if (pc != NULL)
++    *pc = fs->pc;
++  if (hasmultret(ret->k)) {
++    luaK_setmultret(fs, ret);
++    if (ret->k == VCALL && *count == 1) {  /* tail call? */
++      SET_OPCODE(getcode(fs,ret), OP_TAILCALL);
++      lua_assert(GETARG_A(getcode(fs,ret)) == fs->nactvar);
++    }
++    *start = fs->nactvar;
++    *count = LUA_MULTRET;  /* return all values */
++  } else {
++    if (*count == 1)  /* only one single value? */
++      *start = luaK_exp2anyreg(fs, ret);
++    else {
++      luaK_exp2nextreg(fs, ret);  /* values must go to the `stack' */
++      *start = fs->nactvar;  /* return all `active' values */
++      lua_assert(*count == fs->freereg - *start);
++    }
++  }
++}
++
++
++static void addgoto (LexState *ls, int pc, const char *name) {
++  int line = ls->linenumber;
++  TValue value;
++  int g;
++  setsvalue(ls->L, &value, luaX_newstring(ls, name, strlen(name)));
++  g = newlabelentry(ls, &ls->dyd->gt, &value, line, pc, 0);
++  findlabel(ls, g);
++}
++
++
++static void addlabel (LexState *ls, const char *name) {
++  FuncState *fs = ls->fs;
++  Labellist *ll = &ls->dyd->label;
++  TValue value;
++  int l;  /* index of new label being created */
++  setsvalue(ls->L, &value, luaX_newstring(ls, name, strlen(name)));
++  checkrepeated(fs, ll, &value);  /* check for repeated labels */
++  /* create new entry for this label */
++  l = newlabelentry(ls, ll, &value, ls->linenumber, fs->pc, 0);
++  skipnoopstat(ls);  /* skip other no-op statements */
++  if (block_follow(ls, 0)) {  /* label is last no-op statement in the block? */
++    /* assume that locals are already out of scope */
++    ll->arr[l].nactvar = fs->bl->nactvar;
++  }
++  findgotos(ls, &ll->arr[l]);
++}
++
++
+ static void labelstat (LexState *ls, TString *label, int line) {
+   /* label -> '::' NAME '::' */
+   FuncState *fs = ls->fs;
+   Labellist *ll = &ls->dyd->label;
+   int l;  /* index of new label being created */
+-  checkrepeated(fs, ll, label);  /* check for repeated labels */
++  TValue value;
++  setsvalue(ls->L, &value, label);
++  checkrepeated(fs, ll, &value);  /* check for repeated labels */
+   checknext(ls, TK_DBCOLON);  /* skip double colon */
+   /* create new entry for this label */
+-  l = newlabelentry(ls, ll, label, line, fs->pc);
++  l = newlabelentry(ls, ll, &value, line, fs->pc, 0);
+   skipnoopstat(ls);  /* skip other no-op statements */
+   if (block_follow(ls, 0)) {  /* label is last no-op statement in the block? */
+     /* assume that locals are already out of scope */
+@@ -1233,6 +1349,110 @@
+ }
+ 
+ 
++static void jtlabelstat (LexState *ls, int line) {
++  /* label -> ':|' (STRING|NAME|NUMBER|BOOL) '|:' */
++  expdesc jt;
++  TValue value;
++  FuncState *fs = ls->fs;
++  if (ls->t.token == TK_STRING || ls->t.token == TK_NAME) {
++    codestring(ls, &jt, ls->t.seminfo.ts);
++    setsvalue(ls->L, &value, ls->t.seminfo.ts);
++    luaX_next(ls);  /* skip TK_NAME */
++  } else {
++    int unm = 0;
++    if (ls->t.token == '-') {
++      unm = 1;
++      luaX_next(ls);
++    }
++    if (ls->t.token != TK_FLT && ls->t.token != TK_INT &&
++        ls->t.token != TK_TRUE && ls->t.token != TK_FALSE &&
++        ls->t.token != TK_NIL)
++      luaX_syntaxerror(ls, "invalid jumpto label");
++    simpleexp(ls, &jt);
++    if (jt.k == VNIL) {
++      setnilvalue(&value);
++    } else if (jt.k == VKFLT) {
++      setnvalue(&value, (unm ? -jt.u.nval : jt.u.nval));
++    } else if (jt.k == VKINT) {
++      setivalue(&value, (unm ? -jt.u.ival : jt.u.ival));
++    } else {
++      setbvalue(&value, jt.k == VTRUE);
++    }
++  }
++  if (fs->bl->jtnum == 0)  /* check if we have a jump table */
++    addjumptable(ls);  /* and add one if we do not */
++  else  /* if we do have a jump table then update `endpc' */
++    fs->f->jt[fs->bl->jtnum - 1].endpc = fs->pc;
++  checkrepeated(fs, &ls->dyd->label, &value);  /* repeat label check */
++  newlabelentry(ls, &ls->dyd->label, &value, line, fs->pc, 1);
++  luaK_exp2JT(fs, &jt, 0);
++  checknext(ls, TK_JTCLOSE);
++}
++
++
++static void jtgotostat (LexState *ls) {
++  /* jumpto [or (end|ignore|return|break) on] EXPR */
++  FuncState *fs = ls->fs;
++  BlockCnt *bl = fs->bl;
++  expdesc jt, ret;
++  int retr = NO_REG;
++  int cond = TK_END;  /* default is throw runtime error if no jump point */
++  int rets, retn, retpc;
++  assert(ls->t.token != TK_JUMPTO);
++  if (ls->t.token == TK_OR) {  /* jump conditions */
++    luaX_next(ls);  /* skip 'or' */
++    cond = ls->t.token;
++    luaX_next(ls);  /* skip condition token */
++    if (cond != TK_BREAK && cond != TK_CONTINUE && cond != TK_IGNORE &&
++        cond != TK_RETURN && cond != TK_END)
++      luaX_syntaxerror(ls, "unknown jumpto condition");
++    if (cond == TK_RETURN) {  /* `or return' */
++      if (ls->t.token == TK_ON)
++        rets = retn = 0;  /* no results, so no special handling */
++      else {
++        retr = fs->freereg;
++        new_localvarliteral(ls, "(jumpto)");  /* reserve for `on' expression */
++        luaK_reserveregs(fs, 1);  /* as we need a register before the return */
++        adjustlocalvars(ls, 1);   /* values in case of tail call or multiret */
++        coderet(ls, &ret, &rets, &retn, &retpc);
++      }
++    }
++    checknext(ls, TK_ON);
++  }
++  newlabelentry(ls, &ls->dyd->jt, luaO_nilobject, ls->lastline,
++     /* add entry to jumpto statements list */    fs->pc, 1);
++  if (bl->jtnum == 0)  /* check if we have a jump table */
++    addjumptable(ls);
++  else  /* if we do have a jump table then update `endpc' */
++    fs->f->jt[bl->jtnum - 1].endpc = fs->pc;
++  expr(ls, &jt);
++  if (retr == NO_REG)  /* not `or return' so jumpto can go in any register */
++    luaK_jumptable(fs, &jt, (cond == TK_END) + 1);
++  else  /* jumpto has reserved register to protect return values */
++    luaK_jumptable2reg(fs, &jt, retr, (cond == TK_END) + 1);
++  if (cond == TK_RETURN) {  /* `or return' */
++    Instruction *i = &fs->f->code[fs->pc - 1];  /* get current opcode */
++    lua_assert(GET_OPCODE(*i)==OP_JMPTBL);  /* sanity check */
++    i -= fs->pc - retpc;  /* opcode where tail call may be */
++    if (GET_OPCODE(*i)==OP_TAILCALL) {
++      /* !!KLUDGE!! This code checks if OP_TAILCALL has been coded above */
++      /* and if so it moves it after OP_JMPTBL so things work correctly. */
++      /* This needs to be done here due to limitations with the parser.  */
++      Instruction t = *i;
++      do {  /* loop over instructions between OP_TAILCALL and OP_JMPTBL */
++        *i = *(i + 1);  /* shift each opcode back a position */
++      } while (++i < &fs->f->code[fs->pc - 1]);
++      *i = t;  /* move OP_TAILCALL to front */
++    }
++    luaK_ret(fs, rets, retn);  /* `on return' */
++  } else if (cond == TK_BREAK)  /* `or break' */
++    addgoto(ls, luaK_jump(fs), "break");
++  else if (cond == TK_CONTINUE)  /* `or continue' */
++    addgoto(ls, luaK_jump(fs), "continue");
++  /* `on ignore' falls through, `on end' is runtime error in luaV_jumptable */
++}
++
++
+ static void whilestat (LexState *ls, int line) {
+   /* whilestat -> WHILE cond DO block END */
+   FuncState *fs = ls->fs;
+@@ -1243,6 +1463,7 @@
+   whileinit = luaK_getlabel(fs);
+   condexit = cond(ls);
+   enterblock(fs, &bl, 1);
++  continuelabel(ls);  /* close pending continue */
+   checknext(ls, TK_DO);
+   block(ls);
+   luaK_jumpto(fs, whileinit);
+@@ -1263,6 +1484,7 @@
+   luaX_next(ls);  /* skip REPEAT */
+   statlist(ls);
+   check_match(ls, TK_UNTIL, TK_REPEAT, line);
++  continuelabel(ls);  /* close pending continue */
+   condexit = cond(ls);  /* read condition (inside scope block) */
+   if (bl2.upval)  /* upvalues? */
+     luaK_patchclose(fs, condexit, bl2.nactvar);
+@@ -1295,6 +1517,7 @@
+   adjustlocalvars(ls, nvars);
+   luaK_reserveregs(fs, nvars);
+   block(ls);
++  continuelabel(ls);  /* close pending continue */
+   leaveblock(fs);  /* end of scope for declared variables */
+   luaK_patchtohere(fs, prep);
+   if (isnum)  /* numeric for? */
+@@ -1374,7 +1597,22 @@
+ }
+ 
+ 
+-static void test_then_block (LexState *ls, int *escapelist) {
++static void retstat (LexState *ls) {
++  /* stat -> RETURN [explist] [';'] */
++  FuncState *fs = ls->fs;
++  expdesc e;
++  int first, nret;  /* registers with returned values */
++  if (block_follow(ls, 1) || ls->t.token == ';')
++    first = nret = 0;  /* return no values */
++  else
++    coderet(ls, &e, &first, &nret, NULL);
++  luaK_ret(fs, first, nret);
++  testnext(ls, ';');  /* skip optional semicolon */
++}
++
++
++/* returns 0 if IF statement was goto/jumpto/break shortcut */
++static int test_then_block (LexState *ls, int *escapelist) {
+   /* test_then_block -> [IF | ELSEIF] cond THEN block */
+   BlockCnt bl;
+   FuncState *fs = ls->fs;
+@@ -1382,30 +1620,52 @@
+   int jf;  /* instruction to skip 'then' code (if condition is false) */
+   luaX_next(ls);  /* skip IF or ELSEIF */
+   expr(ls, &v);  /* read condition */
+-  checknext(ls, TK_THEN);
+-  if (ls->t.token == TK_GOTO || ls->t.token == TK_BREAK) {
+-    luaK_goiffalse(ls->fs, &v);  /* will jump to label if condition is true */
+-    enterblock(fs, &bl, 0);  /* must enter block before 'goto' */
+-    gotostat(ls, v.t);  /* handle goto/break */
+-    skipnoopstat(ls);  /* skip other no-op statements */
+-    if (block_follow(ls, 0)) {  /* 'goto' is the entire block? */
+-      leaveblock(fs);
+-      return;  /* and that is it */
++  if (testnext(ls, TK_THEN)) {  /* standard if/then statement */
++    if (ls->t.token == TK_GOTO || ls->t.token == TK_BREAK) {
++      luaK_goiffalse(ls->fs, &v);  /* will jump to label if condition is true */
++      enterblock(fs, &bl, 0);  /* must enter block before 'goto' */
++      gotostat(ls, v.t);  /* handle goto/break */
++      skipnoopstat(ls);  /* skip other no-op statements */
++      if (block_follow(ls, 0)) {  /* 'goto' is the entire block? */
++        leaveblock(fs);
++        return 1;  /* and that is it */
++      }
++      else  /* must skip over 'then' part if condition is false */
++        jf = luaK_jump(fs);
+     }
+-    else  /* must skip over 'then' part if condition is false */
+-      jf = luaK_jump(fs);
+-  }
+-  else {  /* regular case (not goto/break) */
+-    luaK_goiftrue(ls->fs, &v);  /* skip over block if condition is false */
+-    enterblock(fs, &bl, 0);
+-    jf = v.f;
+-  }
+-  statlist(ls);  /* `then' part */
+-  leaveblock(fs);
+-  if (ls->t.token == TK_ELSE ||
+-      ls->t.token == TK_ELSEIF)  /* followed by 'else'/'elseif'? */
+-    luaK_concat(fs, escapelist, luaK_jump(fs));  /* must jump over it */
+-  luaK_patchtohere(fs, jf);
++    else {  /* regular case (not goto/break) */
++      luaK_goiftrue(ls->fs, &v);  /* skip over block if condition is false */
++      enterblock(fs, &bl, 0);
++      jf = v.f;
++    }
++    statlist(ls);  /* `then' part */
++    leaveblock(fs);
++    if (ls->t.token == TK_ELSE ||
++        ls->t.token == TK_ELSEIF)  /* followed by 'else'/'elseif'? */
++      luaK_concat(fs, escapelist, luaK_jump(fs));  /* must jump over it */
++    luaK_patchtohere(fs, jf);
++    return 1;
++  } else if (ls->t.token == TK_GOTO || ls->t.token == TK_JUMPTO ||
++             ls->t.token == TK_BREAK || ls->t.token == TK_CONTINUE ||
++             ls->t.token == TK_RETURN) {
++    if (ls->t.token == TK_JUMPTO) {
++      luaK_goiftrue(ls->fs, &v);  /* skip jumpto if condition false */
++      luaX_next(ls);
++      jtgotostat(ls);
++      luaK_patchtohere(fs, v.f);
++    } else if (ls->t.token == TK_RETURN) {
++      luaK_goiftrue(ls->fs, &v);  /* skip return if condition false */
++      luaX_next(ls);
++      retstat(ls);
++      luaK_patchtohere(fs, v.f);
++    } else {
++      luaK_goiffalse(ls->fs, &v);  /* jump to label if condition is true */
++      gotostat(ls, v.t);
++    }
++    return 0;
++  } else
++    luaX_syntaxerror(ls, "expecetd <then|break|continue|goto|jumpto|return>"
++                         " after if statement");
+ }
+ 
+ 
+@@ -1413,13 +1673,14 @@
+   /* ifstat -> IF cond THEN block {ELSEIF cond THEN block} [ELSE block] END */
+   FuncState *fs = ls->fs;
+   int escapelist = NO_JUMP;  /* exit list for finished parts */
+-  test_then_block(ls, &escapelist);  /* IF cond THEN block */
+-  while (ls->t.token == TK_ELSEIF)
+-    test_then_block(ls, &escapelist);  /* ELSEIF cond THEN block */
+-  if (testnext(ls, TK_ELSE))
+-    block(ls);  /* `else' part */
+-  check_match(ls, TK_END, TK_IF, line);
+-  luaK_patchtohere(fs, escapelist);  /* patch escape list to 'if' end */
++  if (test_then_block(ls, &escapelist)) {  /* IF cond THEN block */
++    while (ls->t.token == TK_ELSEIF)
++      test_then_block(ls, &escapelist);  /* ELSEIF cond THEN block */
++    if (testnext(ls, TK_ELSE))
++      block(ls);  /* `else' part */
++    check_match(ls, TK_END, TK_IF, line);
++    luaK_patchtohere(fs, escapelist);  /* patch escape list to 'if' end */
++  }
+ }
+ 
+ 
+@@ -1496,36 +1757,116 @@
+ }
+ 
+ 
+-static void retstat (LexState *ls) {
+-  /* stat -> RETURN [explist] [';'] */
+-  FuncState *fs = ls->fs;
+-  expdesc e;
+-  int first, nret;  /* registers with returned values */
+-  if (block_follow(ls, 1) || ls->t.token == ';')
+-    first = nret = 0;  /* return no values */
+-  else {
+-    nret = explist(ls, &e);  /* optional return values */
+-    if (hasmultret(e.k)) {
+-      luaK_setmultret(fs, &e);
+-      if (e.k == VCALL && nret == 1) {  /* tail call? */
+-        SET_OPCODE(getcode(fs,&e), OP_TAILCALL);
+-        lua_assert(GETARG_A(getcode(fs,&e)) == fs->nactvar);
+-      }
+-      first = fs->nactvar;
+-      nret = LUA_MULTRET;  /* return all values */
+-    }
+-    else {
+-      if (nret == 1)  /* only one single value? */
+-        first = luaK_exp2anyreg(fs, &e);
++#define CASE_NONE   0   /* case did not end with either break or continue */
++#define CASE_BREAK  1   /* case ended with break statement */
++#define CASE_CONT  -1   /* case ended with continue statement */
++
++/* returns 1 if block ended with break command */
++static int caselist (LexState *ls, int andbrk) {
++  /* caselist -> { stat [`;'] } */
++  int brk = 0;  /* flag if break last seen */
++  int cnt = 0;  /* flag if continue last seen */
++  int stm = 0;  /* have seen statements */
++  int look = 0; /* look ahead token */
++  while (ls->t.token != TK_CASE &&
++         ls->t.token != TK_ELSE &&
++         ls->t.token != TK_END) {
++    brk = (ls->t.token == TK_BREAK);
++    cnt = (ls->t.token == TK_CONTINUE);
++    look = luaX_lookahead(ls);
++    if (cnt) {  /* token is TK_CONTINUE */
++      if (!andbrk && (look == TK_CASE || look == TK_END || look == TK_ELSE))
++        semerror(ls,
++         "<continue> not required at end of case block for unmodified switch");
++      else if (look != TK_CASE && look != TK_END && look != TK_ELSE)
++        addgoto(ls, luaK_jump(ls->fs), "continue");
++      luaX_next(ls);  /* skip CONTINUE */
++    } else if (brk) {
++      if (andbrk && (look == TK_CASE || look == TK_END || look == TK_ELSE))
++        semerror(ls,
++              "<break> not required at end of case block for modified switch");
+       else {
+-        luaK_exp2nextreg(fs, &e);  /* values must go to the `stack' */
+-        first = fs->nactvar;  /* return all `active' values */
+-        lua_assert(nret == fs->freereg - first);
++        addgoto(ls, luaK_jump(ls->fs), "break");
++        luaX_next(ls);  /* skip BREAK */
+       }
++    } else
++      statement(ls);
++    stm++;
++  }
++  if (!stm && andbrk)
++    luaX_syntaxerror(ls, "empty case body in modified switch statement");
++  return (brk || (andbrk && ls->t.token == TK_END)) ? CASE_BREAK :
++                                                cnt ? CASE_CONT  : CASE_NONE;
++}
++
++
++static void switchstat (LexState *ls, int line) {
++  /* switchstat -> SWITCH [and (break|continue) on] expr */
++  /*                  (CASE stat|ELSE)  */
++  FuncState *fs = ls->fs;
++  BlockCnt bl, cbl;  /* switch and case blocks */
++  expdesc vs, vc;  /* closure, switch and case expressions */
++  int neg, brkcnt;
++  int andbrk = 0;
++  luaX_next(ls);  /* skip switch keyword */
++  if (ls->t.token == TK_AND) {
++    luaX_next(ls);  /* skip and */
++    if (ls->t.token == TK_BREAK)
++      andbrk = 1;
++    else if (ls->t.token != TK_CONTINUE)  /* continue is the default */
++      luaX_syntaxerror(ls, "invalid switch modifier");
++    luaX_next(ls);  /* skip break or continue */
++    checknext(ls, TK_ON);
++  }
++  enterblock(fs, &bl, 0);
++  addjumptable(ls);
++  expr(ls, &vs);  /* test expression */
++  luaK_jumptable(fs, &vs, 0);
++  addgoto(ls, luaK_jump(ls->fs), "(else)");
++  do {
++    checknext(ls, TK_CASE);
++    neg = 0;
++    vc.u.nval = 0;
++    switch (ls->t.token) {
++      case '-':  /* check for negative numbers */
++        luaX_next(ls);
++        neg = 1;
++        if (ls->t.token != TK_FLT && ls->t.token != TK_INT)
++          luaX_syntaxerror(ls, "case value must be constant");
++        /* fall through */
++      case TK_FLT: case TK_INT: case TK_STRING:  /* values must be constant */
++      case TK_TRUE: case TK_FALSE: case TK_NIL:
++        simpleexp(ls, &vc);  /* what to compare against (case value) */
++        if (neg != 0) {  /* number was negative so make it so */
++          if (vc.k == VKFLT)
++            vc.u.nval = -vc.u.nval;  /* floating point */
++          else
++            vc.u.ival = -vc.u.ival;  /* integer */
++        }
++        luaK_exp2JT(ls->fs, &vc, 1);  /* add to jump table */
++        break;
++      default:
++        luaX_syntaxerror(ls, "case value must be constant");
+     }
++    enterblock(fs, &cbl, 0);  /* enter case block */
++    brkcnt = caselist(ls, andbrk);  /* case block */
++    if (brkcnt == CASE_NONE && andbrk)  /* if using 'and break' add break */
++      addgoto(ls, luaK_jump(ls->fs), "break");  /* if missing or no continue */
++    continuelabel(ls);  /* add end of case continue */
++    leaveblock(fs);  /* leave case block */
++  } while(ls->t.token != TK_END && ls->t.token != TK_ELSE);
++  addlabel(ls, "(else)");
++  if (testnext(ls, TK_ELSE)) {  /* else block for default condition */
++    enterblock(fs, &cbl, 0);
++    caselist(ls, andbrk);  /* default block */
++    leaveblock(fs);
++    if (testnext(ls, TK_CASE))  /* make sure else was last block */
++      semerror(ls, "else must be last block of switch statement");
+   }
+-  luaK_ret(fs, first, nret);
+-  testnext(ls, ';');  /* skip optional semicolon */
++  fs->f->jt[fs->bl->jtnum - 1].endpc = ls->fs->pc;  /* for debugging */
++  breaklabel(ls);  /* close pending breaks */
++  leaveblock(fs);
++  check_match(ls, TK_END, TK_SWITCH, line);
+ }
+ 
+ 
+@@ -1541,6 +1882,18 @@
+       ifstat(ls, line);
+       break;
+     }
++    case TK_CASE: {
++      semerror(ls, "<case> not inside a switch statement");
++    }
++    case TK_SWITCH: {  /* stat -> switchstat */
++      switchstat(ls, line);
++      break;
++    }
++/* for clean jump tables patch
++    case TK_CONTINUE: {
++      semerror(ls, "<continue> not inside a case block");
++    }
++*/
+     case TK_WHILE: {  /* stat -> whilestat */
+       whilestat(ls, line);
+       break;
+@@ -1571,6 +1924,16 @@
+         localstat(ls);
+       break;
+     }
++    case TK_JTOPEN: {   /* jump table label */
++      luaX_next(ls);  /* skip opening token */
++      jtlabelstat(ls, line);
++      break;
++    }
++    case TK_JUMPTO: {
++      luaX_next(ls);  /* skip `jumpto' */
++      jtgotostat(ls);
++      break;
++    }
+     case TK_DBCOLON: {  /* stat -> label */
+       luaX_next(ls);  /* skip double colon */
+       labelstat(ls, str_checkname(ls), line);
+@@ -1581,7 +1944,8 @@
+       retstat(ls);
+       break;
+     }
+-    case TK_BREAK:   /* stat -> breakstat */
++    case TK_CONTINUE:  /* stat -> continuelabel */
++    case TK_BREAK:   /* stat -> breaklabel */
+     case TK_GOTO: {  /* stat -> 'goto' NAME */
+       gotostat(ls, luaK_jump(ls->fs));
+       break;
+@@ -1633,12 +1997,13 @@
+   luaC_objbarrier(L, funcstate.f, funcstate.f->source);
+   lexstate.buff = buff;
+   lexstate.dyd = dyd;
+-  dyd->actvar.n = dyd->gt.n = dyd->label.n = 0;
++  dyd->actvar.n = dyd->gt.n = dyd->jt.n = dyd->label.n = 0;
+   luaX_setinput(L, &lexstate, z, funcstate.f->source, firstchar);
+   mainfunc(&lexstate, &funcstate);
+   lua_assert(!funcstate.prev && funcstate.nups == 1 && !lexstate.fs);
+   /* all scopes should be correctly finished */
+-  lua_assert(dyd->actvar.n == 0 && dyd->gt.n == 0 && dyd->label.n == 0);
++  lua_assert(dyd->actvar.n == 0 && dyd->label.n == 0 &&
++             dyd->gt.n == 0 && dyd->jt.n == 0);
+   L->top--;  /* remove scanner's table */
+   return cl;  /* closure is on the stack, too */
+ }
+================================================================================
+--- Lua-5.3w2/src/llex.h	
++++ Lunia-1.0/src/llex.h	
+@@ -24,10 +24,11 @@
+   TK_AND = FIRST_RESERVED, TK_BREAK,
+   TK_DO, TK_ELSE, TK_ELSEIF, TK_END, TK_FALSE, TK_FOR, TK_FUNCTION,
+   TK_GOTO, TK_IF, TK_IN, TK_LOCAL, TK_NIL, TK_NOT, TK_OR, TK_REPEAT,
++  TK_SWITCH, TK_CASE, TK_JUMPTO, TK_ON, TK_IGNORE, TK_CONTINUE,
+   TK_RETURN, TK_THEN, TK_TRUE, TK_UNTIL, TK_WHILE,
+   /* other terminal symbols */
+   TK_IDIV, TK_CONCAT, TK_DOTS, TK_EQ, TK_GE, TK_LE, TK_NE,
+-  TK_SHL, TK_SHR,
++  TK_SHL, TK_SHR, TK_JTOPEN, TK_JTCLOSE,
+   TK_DBCOLON, TK_EOS,
+   TK_FLT, TK_INT, TK_NAME, TK_STRING
+ };
+================================================================================
+--- Lua-5.3w2/src/lopcodes.h	
++++ Lunia-1.0/src/lopcodes.h	
+@@ -203,6 +203,7 @@
+ 
+ OP_CONCAT,/*	A B C	R(A) := R(B).. ... ..R(C)			*/
+ 
++OP_JMPTBL,  /* A B C := pc += JT[R(B)]{R(A)} (see note) */
+ OP_JMP,/*	A sBx	pc+=sBx; if (A) close all upvalues >= R(A) + 1	*/
+ OP_EQ,/*	A B C	if ((RK(B) == RK(C)) ~= A) then pc++		*/
+ OP_LT,/*	A B C	if ((RK(B) <  RK(C)) ~= A) then pc++		*/
+@@ -252,6 +253,10 @@
+ 
+   (*) In OP_LOADKX, the next 'instruction' is always EXTRAARG.
+ 
++  (*) In OP_JMPTBL, if (C > 1) then raise an error if no entry found.
++  if (C == 1) then keyword was `jumpto'; (c == 0) was `switch/case'.
++  `B' is the jump table offset to lookup R(A) in for the `PC' offset.
++
+   (*) For comparisons, A specifies what condition the test should accept
+   (true or false).
+ 
+================================================================================
+--- Lua-5.3w2/src/lparser.h	
++++ Lunia-1.0/src/lparser.h	
+@@ -35,6 +35,7 @@
+ } expkind;
+ 
+ 
++#define vkisconst(k)  (VNIL <= (k) && (k) <= VKINT)
+ #define vkisvar(k)	(VLOCAL <= (k) && (k) <= VINDEXED)
+ #define vkisinreg(k)	((k) == VNONRELOC || (k) == VLOCAL)
+ 
+@@ -63,10 +64,11 @@
+ 
+ /* description of pending goto statements and label statements */
+ typedef struct Labeldesc {
+-  TString *name;  /* label identifier */
++  TValue value;  /* label value (strings for goto, string/number for jumpto */
+   int pc;  /* position in code */
+   int line;  /* line where it appeared */
+   lu_byte nactvar;  /* local level where it appears in current block */
++  lu_byte isjt;  /* flag to indicate is jumpto label */
+ } Labeldesc;
+ 
+ 
+@@ -85,13 +87,23 @@
+     int n;
+     int size;
+   } actvar;
++  Labellist jt;  /* List of jumpto statements */
+   Labellist gt;  /* list of pending gotos */
+   Labellist label;   /* list of active labels */
+ } Dyndata;
+ 
+ 
+-/* control of blocks */
+-struct BlockCnt;  /* defined in lparser.c */
++/* nodes for block list (list of active blocks) */
++typedef struct BlockCnt {
++  struct BlockCnt *previous;  /* chain */
++  short firstlabel;  /* index of first label in this block */
++  short firstgoto;  /* index of first pending goto in this block */
++  short firstjumpto;  /* index of first jumpto statement in this block */
++  int jtnum;  /* jump table number - 0 means no jumptable */
++  lu_byte nactvar;  /* # active locals outside the block */
++  lu_byte upval;  /* true if some variable in the block is an upvalue */
++  lu_byte isloop;  /* true if `block' is a loop */
++} BlockCnt;
+ 
+ 
+ /* state needed to generate code for a given function */
+@@ -105,6 +117,7 @@
+   int jpc;  /* list of pending jumps to `pc' */
+   int nk;  /* number of elements in `k' */
+   int np;  /* number of elements in `p' */
++  int njt;  /* number of jump tables in `jt' */
+   int firstlocal;  /* index of first local var (in Dyndata array) */
+   short nlocvars;  /* number of elements in 'f->locvars' */
+   lu_byte nactvar;  /* number of active local variables */
+================================================================================
+--- Lua-5.3w2/src/lcode.c	
++++ Lunia-1.0/src/lcode.c	
+@@ -27,14 +27,6 @@
+ #include "lvm.h"
+ 
+ 
+-/* test for x == -0 */
+-#if defined(signbit)
+-#define isminuszero(x)	((x) == 0.0 && signbit(x))
+-#else
+-#define isminuszero(x)	((x) == 0.0 && 1.0/(x) < 0.0)
+-#endif
+-
+-
+ #define hasjumps(e)	((e)->t != (e)->f)
+ 
+ 
+@@ -386,6 +378,105 @@
+ }
+ 
+ 
++/*
++** add entries to the jump table
++*/
++static void addjt (FuncState *fs, TValue *key, TValue *val, int isc) {
++  lua_State *L = fs->ls->L;
++  Proto *f = fs->f;
++  const TValue *jmp;
++  int jtnum = fs->bl->jtnum - 1;
++  lua_assert(jtnum < fs->njt);
++  jmp = luaH_get(f->jt[jtnum].table, key);
++  if (!ttisnil(jmp))
++    luaX_syntaxerror(fs->ls,
++                  (isc == 0 ? "jump table constant defined more than once"
++                            : "case value defined more than once"));
++  addk(fs, key, val);  /* add to constant table */
++  setivalue(luaH_set(L, f->jt[jtnum].table, key), fs->pc);
++}
++
++
++static void luaK_nilJT (FuncState *fs, int isc) {
++  TValue k, v;
++  setnilvalue(&v);
++  /* cannot use nil as key; instead use the first jump table to represent nil */
++  sethvalue(fs->ls->L, &k, fs->f->jt[0].table);
++  addjt(fs, &k, &v, isc);
++}
++
++
++static void luaK_stringJT (FuncState *fs, TString *s, int isc) {
++  TValue o;
++  setsvalue(fs->ls->L, &o, s);
++  addjt(fs, &o, &o, isc);
++}
++
++
++/*
++** use userdata as key to avoid collision with float with same value;
++** conversion to 'void*' used only for hash, no "precision" problems
++*/
++static void luaK_integerJT (FuncState *fs, lua_Integer i, int isc) {
++  TValue k, o;
++  setpvalue(&k, cast(void*, cast(size_t, i)));
++  setivalue(&o, i);
++  addjt(fs, &k, &o, isc);
++}
++
++
++static void luaK_floatJT (FuncState *fs, lua_Number n, int isc) {
++  TValue o;
++  lua_Integer i;
++  if (luai_numisnan(n) || isminuszero(n))
++    luaX_syntaxerror(fs->ls, "attempt to use NaN or -0.0 as jump value");
++  if (numisinteger(n, &i)) {
++    luaK_integerJT(fs, i, isc);
++  } else {
++    setnvalue(&o, n);
++    addjt(fs, &o, &o, isc);
++  }
++}
++
++
++static void luaK_boolJT (FuncState *fs, int b, int isc) {
++  TValue o;
++  setbvalue(&o, b);
++  addjt(fs, &o, &o, isc);
++}
++
++
++/* `isc' is 1 when expression being added is for a `case' statement */
++void luaK_exp2JT (FuncState *fs, expdesc *e, int isc) {
++  luaK_exp2val(fs, e);
++  switch (e->k) {
++    case VNIL: {
++      luaK_nilJT(fs, isc);
++      return;
++    }
++    case VTRUE:
++    case VFALSE: {
++      luaK_boolJT(fs, (e->k == VTRUE), isc);
++      return;
++    }
++    case VKFLT: {
++      luaK_floatJT(fs, e->u.nval, isc);
++      return;
++    }
++    case VKINT: {
++      luaK_integerJT(fs, e->u.ival, isc);
++      return;
++    }
++    case VK: {
++      luaK_stringJT(fs, rawtsvalue(&fs->f->k[e->u.info]), isc);
++      return;
++    }
++    default: break;
++  }
++  luaX_syntaxerror(fs->ls, "attempt to add invalid type to jump table");
++}
++
++
+ void luaK_setreturns (FuncState *fs, expdesc *e, int nresults) {
+   if (e->k == VCALL) {  /* expression is an open function call? */
+     SETARG_C(getcode(fs, e), nresults+1);
+@@ -635,6 +726,26 @@
+ }
+ 
+ 
++void luaK_jumptable2reg (FuncState *fs, expdesc *j, int reg, int c) {
++  if (vkisconst(j->k))
++    luaX_syntaxerror(fs->ls, c == 0 ? "switch expression is constant"
++                                    : "jumpto expression is constant");
++  exp2reg(fs, j, reg);
++  luaK_codeABC(fs, OP_JMPTBL, j->u.info, fs->bl->jtnum - 1, c);
++  freeexp(fs, j);
++}
++
++
++void luaK_jumptable (FuncState *fs, expdesc *j, int c) {
++  if (vkisconst(j->k))
++    luaX_syntaxerror(fs->ls, c == 0 ? "switch expression is constant"
++                                    : "jumpto expression is constant");
++  luaK_exp2anyreg(fs, j);
++  luaK_codeABC(fs, OP_JMPTBL, j->u.info , fs->bl->jtnum - 1, c);
++  freeexp(fs, j);
++}
++
++
+ static void invertjump (FuncState *fs, expdesc *e) {
+   Instruction *pc = getjumpcontrol(fs, e->u.info);
+   lua_assert(testTMode(GET_OPCODE(*pc)) && GET_OPCODE(*pc) != OP_TESTSET &&
+================================================================================
+--- Lua-5.3w2/src/lobject.h	
++++ Lunia-1.0/src/lobject.h	
+@@ -383,6 +383,7 @@
+   int *lineinfo;  /* map from opcodes to source lines (debug information) */
+   LocVar *locvars;  /* information about local variables (debug information) */
+   Upvaldesc *upvalues;  /* upvalue information */
++  struct JumpTable *jt;  /* jump table information */
+   union Closure *cache;  /* last created closure with this prototype */
+   TString  *source;  /* used for debug information */
+   int sizeupvalues;  /* size of 'upvalues' */
+@@ -391,6 +392,7 @@
+   int sizelineinfo;
+   int sizep;  /* size of `p' */
+   int sizelocvars;
++  int sizejt;  /* size of `jt' (number of jump tables) */
+   int linedefined;
+   int lastlinedefined;
+   GCObject *gclist;
+@@ -471,7 +473,17 @@
+ } Table;
+ 
+ 
++/*
++** Description of a jump table for function prototypes
++** (starting and ending PC for debug information)
++*/
++typedef struct JumpTable {
++  struct Table *table;  /* jump table */
++  int startpc;  /* first point where table is used (for debugging) */
++  int endpc;    /* last point where table is used (for debugging) */
++} JumpTable;
+ 
++
+ /*
+ ** `module' operation for hashing (size is always a power of 2)
+ */
+================================================================================
+--- Lua-5.3w2/src/lcode.h	
++++ Lunia-1.0/src/lcode.h	
+@@ -40,6 +40,14 @@
+ typedef enum UnOpr { OPR_MINUS, OPR_BNOT, OPR_NOT, OPR_LEN, OPR_NOUNOPR } UnOpr;
+ 
+ 
++/* test for x == -0 */
++#if defined(signbit)
++#define isminuszero(x)	((x) == 0.0 && signbit(x))
++#else
++#define isminuszero(x)	((x) == 0.0 && 1.0/(x) < 0.0)
++#endif
++
++
+ #define getcode(fs,e)	((fs)->f->code[(e)->u.info])
+ 
+ #define luaK_codeAsBx(fs,o,A,sBx)	luaK_codeABx(fs,o,A,(sBx)+MAXARG_sBx)
+@@ -48,6 +56,7 @@
+ 
+ #define luaK_jumpto(fs,t)	luaK_patchlist(fs, luaK_jump(fs), t)
+ 
++
+ LUAI_FUNC int luaK_codeABx (FuncState *fs, OpCode o, int A, unsigned int Bx);
+ LUAI_FUNC int luaK_codeABC (FuncState *fs, OpCode o, int A, int B, int C);
+ LUAI_FUNC int luaK_codek (FuncState *fs, int reg, int k);
+@@ -63,6 +72,7 @@
+ LUAI_FUNC void luaK_exp2nextreg (FuncState *fs, expdesc *e);
+ LUAI_FUNC void luaK_exp2val (FuncState *fs, expdesc *e);
+ LUAI_FUNC int luaK_exp2RK (FuncState *fs, expdesc *e);
++LUAI_FUNC void luaK_exp2JT (FuncState *fs, expdesc *e, int isc);
+ LUAI_FUNC void luaK_self (FuncState *fs, expdesc *e, expdesc *key);
+ LUAI_FUNC void luaK_indexed (FuncState *fs, expdesc *t, expdesc *k);
+ LUAI_FUNC void luaK_goiftrue (FuncState *fs, expdesc *e);
+@@ -70,6 +80,8 @@
+ LUAI_FUNC void luaK_storevar (FuncState *fs, expdesc *var, expdesc *e);
+ LUAI_FUNC void luaK_setreturns (FuncState *fs, expdesc *e, int nresults);
+ LUAI_FUNC void luaK_setoneret (FuncState *fs, expdesc *e);
++LUAI_FUNC void luaK_jumptable2reg (FuncState *fs, expdesc *j, int reg, int c);
++LUAI_FUNC void luaK_jumptable (FuncState *fs, expdesc *j, int c);
+ LUAI_FUNC int luaK_jump (FuncState *fs);
+ LUAI_FUNC void luaK_ret (FuncState *fs, int first, int nret);
+ LUAI_FUNC void luaK_patchlist (FuncState *fs, int list, int target);
+================================================================================

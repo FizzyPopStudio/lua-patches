@@ -1,0 +1,114 @@
+##Jump Tables + If Shortcut + Continue Loops
+
+###Introduction
+
+This patch is for the "Lua 5.3 work 2" release. It probably will not work with other versions of Lua without modification and has only been tested on the aforementioned version.
+
+**This is a Joint Patch:** Jump Tables + If Shortcut + Continue Loops merged into a single patch.
+
+The patch adds the concept of jump tables to Lua function prototypes. Each lexical block has a unique jump table assigned to it once the first `jumpto` statement, jump point label, or `switch` statement is encountered. If a block does not use these features then no jump table will be allocated for that block.
+
+Once a block has a jump table then any jump point labels or case statement values are stored in the table. The jump table is then keyed on the constant value used by the jump point or case statement, the values are the program counter offsets from the start of the function to the jump point or case statement. The only two values not storable in a jump table are NaN and -0.0, which are limitations of Lua itself.
+
+When a `jumpto` or `switch` statement is encountered the result of the expression is looked up in the jump table, if a value is present it is used to calculate the new position of the program counter and execution continues at that point. If there is no value in the table a runtime error is generated for `jumpto` statements, unless modified. Switch statements will jump to the `else` block, if present, otherwise execution will jump to the end of the `switch` block.
+
+This patch also adds a new shortcut form of the `if` statement, created for easier program flow control and to remove extraneous `then` and `end` statements.
+
+Also, this patch adds the `continue` keyword for loop control, it works as you probably expect it to.
+
+
+###Jumpto (Computed Goto)
+
+A jumpto statement has the following syntax:
+
+	jumpto [or (end|ignore|break|continue|return [...]) on] {expr}
+
+The default modifier is `or end`, which will generate a runtime error if the result of `{expr}` is not found in the jump table.
+
+All other modifiers change the error handling behaviour when jump point entries are not found; `ignore` continues execution with the next statement, `break` and `continue` are the flow control statements, and `return` allows you to return from a function. The `return` modifier allows you to return nothing, single or multiple values, including tail calls and vargs.
+
+Now that we have covered `jumpto` we need to specify the format of a jump point label so we have somewhere to jump to. A standard goto label looks like `::this::`, a jump point label looks `:|similar|:` with the notable difference that a jump point label can be any constant (string, number, nil, or boolean) value. These are all valid, and unique, jump point labels:
+
+    :|42|:  :|"quick brown fox"|:  :|33.3|:  :|nil|:  :|true|:  :|false|: 
+    :|"42"|:  :|"nil"|:  :|-3.14|:  :|"-33.3"|:  :|"false"|:  :|"12.34"|:
+
+The labels with quotes are required to ensure ambiguous labels are recognised as strings when a `jumpto` or `switch` statement is encountered.
+
+Two major differences between jump point labels and goto labels is that jump points can not be within the scope of any local variable in a block, even if the jump point is the last thing in the block. When scripts are compiled and a block is closed the parser will check every jump point in the block against every `jumpto` statement to check for violations of lexical scope.
+
+The second difference is that `jumpto` statements can only reference jump point labels within the same lexical block. You can not jump to points contained in nested blocks nor can you jump to any jump points located in the enclosing block, jump labels do not export to outer blocks.
+
+
+###Switch/Case
+
+The `switch/case` statement has the following syntax:
+
+    switch [and (break|continue) on] {expr}
+    	case {const}
+    		{code}
+    	(...)
+    	[else
+    		{code}]
+    end
+
+The `else` block is optional, but if present must be the last block in the `switch` statement.
+
+The `and break` modifier automatically places a `break` statement at the end of every `case` block. The default is `and continue`, which is also the default in most implementations of the `switch/case` expression. You may also use the `break` statement anywhere in the `case` block to jump to the end of the entire `switch` statement. Additionally, the `continue` keyword may be used in a `case` block to jump execution immediately to the next `case` block.
+
+You may nest `switch/case` statements and you may also use `jumpto` inside case blocks; as each case is a new block there will be no conflicts with case values and jump labels. See the `jumpto.lua` test file (added by the tests patch file) for some examples of nested `switch/case` and `jumpto` statements.
+
+
+###If Shortcut
+
+Typically the `if` statement is defined as follows;
+
+	if {cond} then {code} [else[if] {code}](...) end
+
+With this patch the `if` statement now has a new shortcut style:
+
+	if {cond} (goto {label}|jumpto {point}|break|continue|return [...])
+
+With this form of the `if` statement no `end` statement is required, nor are the `else` or `elseif` statements valid. The shorcut `if` statement was developed for the `jumpto` statement, which can only reference jump points within the same lexical block as the `jumpto` itself, however, I quickly realised it was usable for other forms of flow control.
+
+As with the `jumpto or return` statement the `if` shortcut return can handle no values, single or multiple values, tail calls and vargs as return types.
+
+
+###Continue Loops
+
+Loop control in Lua has one keyword; `break`.  One of the more often requested additions to Lua is the `continue` loop control keyword. This patch adds the `contnue` keyword for loop control.
+
+When the `continue` keyword is encountered in a loop, either standalone, via an `if` (shortcut or regular) statement, or as part of a modified `jumpto` statement, execution will jump to the end of the loop, but not out of the loop context like `break`.
+
+This allows loops to check if they need to iterate again after the `continue` was encountered. Please be aware that it is very easy to create infinite loops if the `continue` statement is not correctly used with `while` or `repeat` loops.
+
+###Benchmarks
+
+I did some quick benchmarking to show the efficiency of the `switch/case` statements. Each script below was run 5 times with an iteration of 1,000,000 calls, the shown time is the average of these calls.
+
+    ==== file ====   == 3 ==    == 6 ==    == 13 ==   == 26 ==   = Rand =
+    azGifelse.lua:   1.79187s   2.04329s   2.84767s   4.31683s   3.13985s
+    azGswitch.lua:   1.56020s   1.54594s   1.57489s   1.54292s   1.84061s
+    azLifelse.lua:   1.14142s   1.26719s   1.55459s   2.09323s   1.89476s
+    azLswitch.lua:   1.07550s   1.08567s   1.09610s   1.08649s   1.44026s
+
+These files benchmark `if/else` vs `switch/case`. The number above the times indicates how many if/else statements were chained to get to the final clause. The first two files use global variables, the second two are the exact same test but using local variables.
+
+As you can see the `az(G|L)switch.lua` scripts pretty much have constant time no matter the number of cases. The part that surprised me is that the `switch/case` is even faster than chained if/else of only 3 clauses! The Rand test is a bit longer due to math.random() overhead.
+
+
+###Test Suite Patch
+
+The file in this directory ending with `.tests` is also a patch file, it is intended for patching the Lua Test Suite. Normally you can directly download the test suite from the Lua website, however, as this patch targets a pre-release version of Lua that test suite is not directly available.
+
+The good news is that a link to the test suite was posted on the mailing list: [Lua 5.3 work 2 Test Suite](http://www.lua.org/work/lua-5.3.w2-tests.tar.gz)
+
+
+###Acknowledgements
+
+**Roberto Ierusalimschy, Luiz Henrique de Figueiredo, and Waldemar Celes**: Developers of the Lua programming language.
+
+**Kein-Hong Man, esq**: Author of "*A No-Frills Introduction to Lua 5.1 VM Instructions*", an invaluable resource.
+
+[**Lua-L Mailing List**](http://www.lua.org/lua-l.html): Thank you to all members of the Lua-L mailing list who provide thought provoking discussion about Lua on an almost daily basis.
+
+[**Power Patches Wiki Page**](http://lua-users.org/wiki/LuaPowerPatches/): Thank you to all the developers who posted their power patches for others to use and learn from.

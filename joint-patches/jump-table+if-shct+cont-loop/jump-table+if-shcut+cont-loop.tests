@@ -1,0 +1,1451 @@
+================================================================================
+ Patch: Jump Tables + Switch Case + Jumpto + If Shortcut + Continue Loops (Tests)
+Source: Lua 5.2 work 2
+  Date: 2014-05-04 Sun 04 May 2014
+Author: Paige Marie DePol [FizzyPop Studios]
+Online: http://lunia.fizzypopstudios.com
+
+Adds tests for jump tables; jumpto and switch-case statements.
+Adds tests for if shortcut statement.
+Adds tests for continue loop control.
+================================================================================
+--- Lua-5.3w2/test/constructs.lua
++++ Lunia-1.0/test/constructs.lua
+@@ -52,6 +52,44 @@
+ assert(1234567890 == tonumber('1234567890') and 1234567890+1 == 1234567891)
+ 
+ 
++-- continue
++---- fornum
++r = 0
++for i=1,10 do
++	if (i % 2 == 0)  then continue end
++	r = r + 1
++end
++assert(r==5)
++
++---- forlist
++r = 0
++for _,i in ipairs({ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }) do
++	if (i % 2 == 0)  then continue end
++	r = r + i
++end
++assert(r==25)
++
++---- while
++r = 0
++i = 0
++while (i < 10) do
++	i = i + 1
++	if (i % 2 == 1) then continue end
++  r = r + 1
++end
++assert(r==5)
++ 
++---- repeat
++r = 0
++i = 10
++repeat
++	i = i - 1
++	if (i % 2 == 1)  then continue end
++	r = r + 1
++until (i < 0)
++assert(r==5)
++
++
+ -- silly loops
+ repeat until 1; repeat until true;
+ while false do end; while nil do end;
+================================================================================
+--- Lua-5.3w2/test/all.lua
++++ Lunia-1.0/test/all.lua
+@@ -169,6 +169,8 @@
+ dofile('vararg.lua')
+ dofile('closure.lua')
+ dofile('coroutine.lua', true)
++dofile('ifshortcut.lua')
++dofile('jumpto.lua')
+ dofile('goto.lua')
+ dofile('errors.lua', true)
+ dofile('math.lua')
+================================================================================
+--- Lua-5.3w2/test/code.lua
++++ Lunia-1.0/test/code.lua
+@@ -41,7 +41,6 @@
+   local arg = {...}
+   local c = T.listcode(f)
+   for i=1, #arg do
+-    -- print(arg[i], c[i])
+     assert(string.find(c[i], '- '..arg[i]..' *%d'))
+   end
+   assert(c[#arg+2] == nil)
+@@ -215,5 +214,139 @@
+ function (a) while true do if not(a < 10) then break end; a = a + 1; end end
+ )
+ 
++--------------------------------------------------------------------------------
++-- testing jumpto code generation
++
++-- simple jumpto
++check(function (a)
++        local x=33
++        jumpto x
++        :|33|:
++        x=1
++      end,
++      'LOADK', 'JMPTBL', 'LOADK', 'RETURN');
++
++-- jumpto `on return' with tail calls
++local tail = function() return 42 end
++
++check(function (x)
++        jumpto or return tail() on x
++        :|42|:
++        return true
++      end,
++      'GETUPVAL', 'MOVE', 'JMPTBL', 'TAILCALL',
++      'RETURN', 'LOADBOOL', 'RETURN');
++
++check (function (x)
++         local function tail() return 33 end
++         jumpto or return tail() on x
++         :|42|:
++         return true
++       end,
++      'CLOSURE', 'MOVE', 'MOVE', 'JMPTBL', 'TAILCALL',
++      'RETURN', 'LOADBOOL', 'RETURN');
++
++G = 42
++local L = 33
++
++check(function()
++        jumpto or return tail() on L
++        :|42|:
++        return true
++      end,
++      'GETUPVAL', 'GETUPVAL', 'JMPTBL', 'TAILCALL',
++      'RETURN', 'LOADBOOL', 'RETURN');
++
++check(function()
++        local l = L
++        jumpto or return tail() on l
++        :|42|:
++        return true
++      end,
++      'GETUPVAL', 'GETUPVAL', 'MOVE', 'JMPTBL',
++      'TAILCALL', 'RETURN', 'LOADBOOL', 'RETURN');
++
++check(function()
++        jumpto or return tail() on G
++        :|42|:
++        return true
++      end,
++      'GETUPVAL', 'GETTABUP', 'JMPTBL', 'TAILCALL',
++      'RETURN', 'LOADBOOL', 'RETURN');
++
++check(function()
++        local g = G
++        jumpto or return tail() on g
++        :|42|:
++        return true
++      end,
++      'GETTABUP', 'GETUPVAL', 'MOVE', 'JMPTBL',
++      'TAILCALL', 'RETURN', 'LOADBOOL', 'RETURN');
++
++
++-- select/case (fallthrough)
++check(function (a)
++        local x=33
++        switch x
++          case 33
++            x=1
++          case 42
++            x=2
++          else
++            x=0
++        end
++      end,
++      'LOADK', 'JMPTBL', 'JMP', 'LOADK', 'LOADK', 'LOADK', 'RETURN');
++
++-- select/case (fallthrough with break and if break)
++check(function(a)
++        local x=33
++        switch x
++          case 33
++            x=1
++            break
++          case 42
++            x=2
++            if x==1 break
++          else
++            x=0
++        end
++      end,
++      'LOADK', 'JMPTBL', 'JMP', 'LOADK', 'JMP',
++      'LOADK', 'EQ', 'JMP', 'LOADK', 'RETURN');
++
++-- select/case (`and break' with no flow-control statements)
++check(function(a)
++        local x=33
++        switch and break on x
++          case 33
++            x=1
++          case 42
++            x=2
++          else
++            x=0
++        end
++      end,
++      'LOADK', 'JMPTBL', 'JMP', 'LOADK', 'JMP',
++      'LOADK', 'JMP', 'LOADK', 'RETURN');
++
++-- select/case (`and break' with continue and if continue)
++check(function(a)
++        local x=33
++        switch and break on x
++          case 33
++            x=1
++            continue
++          case 42
++            x=2
++            if x==1 continue
++            x=3
++          else
++            x=0
++        end
++      end,
++      'LOADK', 'JMPTBL', 'JMP', 'LOADK', 'LOADK', 'EQ',
++      'JMP', 'LOADK', 'JMP', 'LOADK', 'RETURN');
++
+ print 'OK'
+ 
+================================================================================
+--- Lua-5.3w2/test/errors.lua
++++ Lunia-1.0/test/errors.lua
+@@ -404,7 +404,7 @@
+ testrep("a=", "(")
+ testrep("", "a(")
+ testrep("", "do ")
+-testrep("", "while a do ")
++testrep("", "while a do ", "blocks")
+ testrep("", "if a then else ")
+ testrep("", "function foo () ")
+ testrep("a=", "a..")
+================================================================================
+--- Lua-5.3w2/test/jumpto.lua
++++ Lunia-1.0/test/jumpto.lua
+@@ -0,0 +1,1004 @@
++-- testing jumpto and switch/case syntax
++
++collectgarbage()
++
++local function errmsg (code, m)
++  local st, msg = load(code)
++  assert(not st and string.find(msg, m))
++end
++
++
++-- jumpto is constant value
++errmsg([[ jumpto 42 ]], "jumpto expression is constant")
++errmsg([[ jumpto 33.3 ]], "jumpto expression is constant")
++errmsg([[ jumpto -42 ]], "jumpto expression is constant")
++errmsg([[ jumpto -33.3 ]], "jumpto expression is constant")
++errmsg([[ jumpto "ack" ]], "jumpto expression is constant")
++errmsg([[ jumpto 42+5 ]], "jumpto expression is constant")
++errmsg([[ jumpto 33.3+3.14 ]], "jumpto expression is constant")
++errmsg([[ jumpto nil ]], "jumpto expression is constant")
++errmsg([[ jumpto 1/0 ]], "jumpto expression is constant")
++
++
++-- should be errors but are not due to current limitations
++errmsg([[ jumpto "ack".."oop" ]], "no jump points")
++errmsg([[ jumpto 0/0 ]], "no jump points")
++errmsg([[ jumpto -0.0 ]], "no jump points")
++
++
++-- block has jumpto statement and/or no jump points
++errmsg([[ do local point = "error" jumpto point end" ]], "no jump points")
++errmsg([[ do :|error|: end" ]], "for jump points")
++
++
++-- repeated labels (conflicts)
++errmsg([[ :|l1|: ::l1:: ]], "already defined for jumpto")
++errmsg([[ :|l1|: :|l1|: ]], "already defined for jumpto")
++errmsg([[ ::l1:: :|l1|: ]], "already defined for goto")
++errmsg([[ :|42|: :|42|: ]], "already defined for jumpto")
++errmsg([[ :|true|: :|true|: ]], "already defined for jumpto")
++errmsg([[ :|false|: :|false|: ]], "already defined for jumpto")
++errmsg([[ :|string|: :|string|: ]], "already defined for jumpto")
++errmsg([[ :|string|: :|"string"|: ]], "already defined for jumpto")
++errmsg([[ :|"string"|: :|string|: ]], "already defined for jumpto")
++errmsg([[ :|33|: :|33.0|: ]], "already defined for jumpto");
++errmsg([[ :|33.0|: :|33|: ]], "already defined for jumpto");
++
++
++-- stringified labels (no conflicts)
++errmsg([[ :|42|: :|"42"|: ]], "for jump points")
++errmsg([[ :|true|: :|"true"|: ]], "for jump points")
++errmsg([[ :|false|: :|"false"|: ]], "for jump points")
++errmsg([[ :|33.3|: :|"33.3"|: ]], "for jump points")
++errmsg([[ :|ack oop|: ]], "'|:' expected")  -- strings with spaces need quotes
++
++
++-- jumping over variable definition
++errmsg([[ local point = "l1" jumpto point; local aa :|l1|: print(point) ]], "local 'aa'")
++errmsg([[ local point = "l1" jumpto point; local aa :|l1|: ]], "local 'aa'") -- even if at end of block
++
++
++-- cannot jump into any lexical scope with jumpto, not even at end of block
++errmsg([[
++  repeat
++    x = "cont"
++    if x jumpto x
++    local xuxu = 10
++    :|cont|:
++  until xuxu < x
++]], "local 'xuxu'")
++
++
++-- simple jumptos
++local x
++local z = "l1"
++do
++  local y = 12
++  jumpto z
++  :|l2|: x = x + 1; z = "l3"; jumpto z
++  :|l1|: x = y; z = "l2"; jumpto z
++  :|l3|:
++end
++assert(x == 13)
++
++
++-- long labels
++do
++  local prog = [[
++  do
++    local a = 1
++    local pa = "l%sa"
++    local pb = "l%sb"
++    jumpto pa; a = a + 1
++   :|l%sa|: a = a + 10
++    jumpto pb; a = a + 2
++   :|l%sb|: a = a + 20
++    return a
++  end
++  ]]
++  local label = string.rep("0123456789", 40)
++  prog = string.format(prog, label, label, label, label)
++  assert(assert(load(prog))() == 31)
++end
++
++
++-- goto to correct label when nested (not to previous label)
++do local p = "l3"; jumpto p; print(p); :|l3|: end
++
++
++-- can jump over a block with a local dec. in it
++do
++  local p = "11"
++  jumpto p
++  do
++    local a = 23
++    x = a
++  end
++  :|"11"|:
++end
++assert(x == 13)
++
++
++-- ensure integral floats are transformed to integers
++do
++  local r = 0
++  local p = 42
++  jumpto or ignore on p
++  error("should not be here")
++  :|420|: r = r + 10; jumpto p / 42         -- 1.0f (keys on 1i)
++  :|7.5|: r = r + 20; jumpto p / 7          -- 6.0f (keys on 6i)
++  :|6|:   r = r + 30; jumpto p // 8         -- 5i
++  :|42|:  r = r + 40; jumpto p * 10         -- 420i
++  :|1|:   r = r + 50; jumpto (p / 6) + 0.5  -- 7.5f
++  :|5|:   r = r + 60
++  assert(r == 210)
++end
++
++x = 50
++:|11|: :|22|: :|33|: :|44|: :|55|:
++jumpto or ignore on x  -- required for above jump points
++
++-- repeating labels in block is OK
++do
++  local ret = 0
++  jumpto x
++  :|11|:
++    ret = ret + 10
++  :|33|:
++    ret = ret + 30
++  :|50|:
++    ret = ret + 50
++  :|77|:
++    ret = ret + 70
++  :|99|:
++    ret = ret + 90
++  assert(ret==210)
++end
++
++
++-- repeating labels in a function is OK
++local function foo ()
++  local p = 33
++  local a = {}
++  jumpto p
++  :|11|: a[#a + 1] = 1; p=p+11; jumpto p;
++  :|22|: a[#a + 1] = 2; p=p+33; jumpto p;
++  ::redo::
++  :|33|: a[#a + 1] = 3; p=p-22; jumpto p;
++  :|44|: a[#a + 1] = 4; p=p+22; jumpto p;
++  :|55|: a[#a + 1] = 5; p=p-11; jumpto p;
++  :|66|: assert(a[1] == 3 and a[2] == 1 and a[3] == 2 and
++              a[4] == 5 and a[5] == 4)
++  if not a[6] then a[6] = true; goto redo end   -- do it twice
++end
++
++foo()
++
++
++-- can't jump to labels in another block
++do
++  local ret = 0;
++  x = 30;
++  jumpto or ignore on x
++  goto err
++
++  :|10|:
++    ret = ret + 10
++  :|20|:
++    ret = ret + 20
++
++  do
++    :|30|:
++      ret = ret + 30
++    :|40|:
++      ret = ret + 40
++    jumpto x  -- required to avoid syntax error
++  end
++
++::err::
++  assert(ret==0)
++end
++
++
++-- can jumpto a nil value
++x = nil
++do jumpto x
++:|nil|: end
++x = 42
++assert(x==42)
++
++
++--------------------------------------------------------------------------------
++-- testing jumpto conditions
++
++-- check basic jump points and 'no jump point' errors for all types
++function checkit (s,err)
++  local f, msg = load(s)
++  if f == nil then return nil end
++  _, msg = pcall(f)
++  return ((msg==err) or string.find(msg,err))
++end
++
++---- string
++do
++  assert(checkit([[
++    do
++      local x = "meow"
++      jumpto x
++      :|"meow"|:  do return x end
++      :|42|:      error "should not be here"
++      :|"42"|:    error "should not be here"
++      :|33.3|:    error "should not be here"
++      :|nil|:     error "should not be here"
++      :|true|:    error "should not be here"
++      return nil
++    end ]], "meow"))
++end
++
++------ checking error message
++do
++  assert(checkit([[
++    do
++      local x = "meow"
++      jumpto or end on x
++      :|notused|:
++    end ]], "no jump point for <jumpto meow>"))
++end
++
++---- string w/spaces
++do
++  assert(checkit([[
++    do
++      local x = "ack oop"
++      jumpto x
++      :|"meow"|:    error "should not be here"
++      :|42|:        error "should not be here"
++      :|"ack oop"|: do return x end
++      :|33.3|:      error "should not be here"
++      :|nil|:       error "should not be here"
++      :|true|:      error "should not be here"
++      return nil
++    end ]], "ack oop"))
++end
++
++------ checking error message
++do
++  assert(checkit([[
++    do
++      local x = "ack oop"
++      jumpto or end on x
++      :|notused|:
++    end ]], "no jump point for <jumpto \"ack oop\">"))
++end
++
++---- string looks like number
++do
++  assert(checkit([[
++    do
++      local x = "33.3"
++      jumpto x
++      :|"meow"|:    error "should not be here"
++      :|42|:        error "should not be here"
++      :|"33.3"|:    do return x end
++      :|33.3|:      error "should not be here"
++      :|nil|:       error "should not be here"
++      :|true|:      error "should not be here"
++      return nil
++    end ]], "33.3"))
++end
++
++------ checking error message
++do
++  assert(checkit([[
++    do
++      local x = "33.3"
++      jumpto or end on x
++      :|notused|:
++    end ]], "no jump point for <jumpto \"33.3\">"))
++end
++
++---- integer (positive)
++do
++  assert(checkit([[
++    do
++      local x = 42
++      jumpto or end on x
++      :|"42"|: error "should not be here"
++      :|42|:   do return x end
++      :|33.3|: error "should not be here"
++      :|nil|:  error "should not be here"
++      :|true|: error "should not be here"
++      return nil
++    end ]], 42))
++end
++
++------ checking error message
++do
++  assert(checkit([[
++    do
++      local x = 42
++      jumpto or end on x
++      :|notused|:
++    end ]], "no jump point for <jumpto 42>"))
++end
++
++---- integer (negative)
++do
++  assert(checkit([[
++    do
++      local x = -2501
++      jumpto or end on x
++      :|"42"|:  error "should not be here"
++      :|-2501|: do return x end
++      :|33.3|:  error "should not be here"
++      :|nil|:   error "should not be here"
++      :|true|:  error "should not be here"
++      return nil
++    end ]], -2501))
++end
++
++------ checking error message
++do
++  assert(checkit([[
++    do
++      local x = 42
++      jumpto or end on x
++      :|notused|:
++    end ]], "no jump point for <jumpto 42>"))
++end
++
++---- floating (positive)
++do
++  assert(checkit([[
++    do
++      local x = 33.3
++      jumpto or end on x
++      :|"42"|: error "should not be here"
++      :|42|:   error "should not be here"
++      :|33.3|: do return x end
++      :|nil|:  error "should not be here"
++      :|true|: error "should not be here"
++      return nil
++    end ]], 33.3))
++end
++
++------ checking error message
++do
++  assert(checkit([[
++    do
++      local x = 33.3
++      jumpto or end on x
++      :|notused|:
++    end ]], "no jump point for <jumpto 33.3>"))
++end
++
++---- floating (negative)
++do
++  assert(checkit([[
++    do
++      local x = -3.14
++      jumpto or end on x
++      :|"42"|:  error "should not be here"
++      :|42|:    error "should not be here"
++      :|-3.14|: do return x end
++      :|nil|:   error "should not be here"
++      :|true|:  error "should not be here"
++      return nil
++    end ]], -3.14))
++end
++
++------ checking error message
++do
++  assert(checkit([[
++    do
++      local x = -3.14
++      jumpto or end on x
++      :|notused|:
++    end ]], "no jump point for <jumpto --3.14>"))
++end
++
++---- nil
++do
++  assert(checkit([[
++    do
++      local x = nil
++      jumpto or end on x
++      :|"42"|: error "should not be here"
++      :|42|:   error "should not be here"
++      :|33.3|: error "should not be here"
++      :|nil|:  do return x end
++      :|true|: error "should not be here"
++      return nil
++    end ]], nil))
++end
++
++------ checking error message
++do
++  assert(checkit([[
++    do
++      local x = nil
++      jumpto or end on x
++      :|notused|:
++    end ]], "no jump point for <jumpto nil>"))
++end
++
++---- boolean (true)
++do
++  assert(checkit([[
++    do
++      local x = true
++      jumpto or end on x
++      :|"42"|:  error "should not be here"
++      :|42|:    error "should not be here"
++      :|33.3|:  error "should not be here"
++      :|nil|:   error "should not be here"
++      :|true|:  do return x end
++      :|false|: error "should not be here"
++      return nil
++    end ]], true))
++end
++
++------ checking error message
++do
++  assert(checkit([[
++    do
++      local x = true
++      jumpto or end on x
++      :|notused|:
++    end ]], "no jump point for <jumpto true>"))
++end
++
++
++---- boolean (false)
++do
++  assert(checkit([[
++    do
++      local x = false
++      jumpto or end on x
++      :|"42"|:  error "should not be here"
++      :|42|:    error "should not be here"
++      :|33.3|:  error "should not be here"
++      :|nil|:   error "should not be here"
++      :|true|:  error "should not be here"
++      :|false|: do return x end
++      return nil
++    end ]], false))
++end
++
++------ checking error message
++do
++  assert(checkit([[
++    do
++      local x = false
++      jumpto or end on x
++      :|notused|:
++    end ]], "no jump point for <jumpto false>"))
++end
++
++
++-- `or return'
++local tail = function() return 42,-33,24601 end
++
++local jtp = 0
++local x,y,z,w
++
++-- vargs can be returned
++local varg = function(...)
++                jumpto or return ... on jtp
++                :|42|:
++                return 25, "ack", nil, "oop", 12, 34
++              end
++
++jtp = 42
++x,y,z,w = varg(123,456,789,012)
++assert(x==25 and y=="ack" and z==nil and w=="oop")
++
++jtp = 33
++x,y,z,w = varg(976,nil,321,098)
++assert(x==976 and y==nil and z==321 and w==098)
++
++
++-- tailcall can be returned
++local func = function(y)
++                jumpto or return tail() on y
++                :|33|:
++                return 25, nil, false
++              end
++
++x,y,z = func(33)
++assert(x==25 and y==nil and z==false)
++
++x,y,z = func(42)
++assert(x==42 and y==-33 and z==24601)
++
++
++-- expression can be returned
++local mult = function(x)
++                jumpto or return x * -5 on x
++                :|10|: do return x * 5 end
++                :|20|: do return x * 12.5 end
++              end
++
++x = mult(3)
++assert(x==-15)
++
++x = mult(10)
++assert(x==50)
++
++x = mult(20)
++assert(x==250)
++
++
++-- `or ignore'
++ret = 0;
++x = "meow"
++do
++  :|mix|:
++  jumpto or ignore on x
++  ret = ret + 42
++  assert(ret==42);
++end
++
++
++-- `or break'
++ret = 0
++while (1) do
++  ret = ret + 10
++  jumpto or break on ret
++  :|10|:
++    ret = ret + 1
++  :|12.5|:
++    ret = ret + 2
++  :|35|:
++    ret = ret + 3
++  :|46.0|:
++    ret = ret + 4
++  :|57|:
++    ret = ret + 5
++end
++assert(ret==72)
++
++
++-- `or continue'
++ret = 0
++repeat
++  ret = ret + 10
++  jumpto or continue on ret
++  :|10|:
++    ret = ret + 1
++  :|72|:
++    ret = ret + 2
++  :|35|:
++    ret = ret + 3
++  :|96|:
++    ret = ret + 4
++  :|57|:
++    ret = ret + 5
++until ret > 100
++assert(ret==105)
++
++
++--------------------------------------------------------------------------------
++-- testing switch/case
++
++-- syntax errors
++errmsg([[ switch nil ]], "switch expression is constant")
++errmsg([[ switch 1/0 ]], "switch expression is constant")
++errmsg([[ switch nil ]], "switch expression is constant")
++errmsg([[ switch 42 ]], "switch expression is constant")
++errmsg([[ switch 33.0 ]], "switch expression is constant")
++errmsg([[ switch true ]], "switch expression is constant")
++errmsg([[ switch false ]], "switch expression is constant")
++errmsg([[ switch "meow" ]], "switch expression is constant")
++
++errmsg([[ local p = 77; switch p case p ]], "case value must be constant")
++errmsg([[ g = 33; switch g case g ]], "case value must be constant")
++errmsg([[ g = 33; local p = 99; switch p case g ]], "case value must be constant")
++
++errmsg([[ g = 33; switch g case 42 case 42 ]], "case value defined more than once")
++errmsg([[ g = 33; switch g case 33.0 case 33 ]], "case value defined more than once")
++errmsg([[ g = 33; switch g case 33 case 33.0 ]], "case value defined more than once")
++errmsg([[ g = 33; switch g case "meow" case "meow" ]], "case value defined more than once")
++errmsg([[ g = 33; switch g case true case true ]], "case value defined more than once")
++
++errmsg([[ case ]], "<case> not inside a switch statement")
++errmsg([[ break ]], "not inside a loop or case block")
++
++errmsg([[ x = 1; switch x case 1 continue end ]], "<continue> not required");
++errmsg([[ x = 1; switch and break on x case 1 break end ]], "<break> not required");
++
++
++-- bare-bones switch
++switch x case false end
++
++local ret = 33
++local x = "0"
++
++switch and break on x
++    case 0
++      ret = 99
++    case "0"
++      ret = 42
++end
++assert(ret==42)
++
++x = 0
++switch and break on x
++    case 0
++      ret = 99
++    case "0"
++      ret = 42
++end
++assert(ret==99)
++
++
++ret = 0
++x = "first"
++-- testing fallthrough
++ret = 0
++switch x
++  case "first"
++    ret = ret + 11
++  case 24601
++    ret = ret + 22
++  case "last"
++    ret = ret + 33
++end
++assert(ret==66)
++
++
++-- testing else condition
++x = 24601
++switch x
++  case "ack"
++    ret = 111
++  case 12
++    ret = 222
++  case 3.14
++    ret = 333
++  case false
++    ret = 444
++  else
++    ret = 555
++end
++assert(ret==555)
++
++
++-- testing `and break`
++ret = 0
++switch and break on x
++  case "first"
++    ret = ret + 11
++  case 24601
++    ret = ret + 22
++  case "last"
++    ret = ret + 33
++end
++assert(ret==22)
++
++
++-- testing `and break` with continue
++x = "first"
++ret = 0
++switch and break on x
++  case "first"
++    ret = ret + 11
++    continue
++  case 24601
++    ret = ret + 22
++    if ret == 33 then continue end
++    ret = ret + 99
++  case "last"
++    ret = ret + 33
++  else
++    error("should not be here")
++end
++assert(ret==66)
++
++
++-- testing break statement
++x = "first"
++ret = 0
++switch x
++  case "first"
++    ret = ret + 11
++  case -42
++    ret = ret + 22
++    break
++  case "last"
++    ret = ret + 33
++  else
++    ret = ret + 44
++end
++assert(ret==33)
++
++
++-- array to test a variety of data types
++local test = { 33, "ack", 42.3, "oop", 33.0, "nil", -3.14, 0.0, true, -2501, false, 0, "else"};
++
++
++-- testing basic case values with `and break` modifier
++ret = 0;
++for _,x in ipairs(test) do
++  if x == "nil" then x = nil end
++  switch and break on x
++    case 33
++      ret = ret + 11
++    case "ack"
++      ret = ret + 22
++    case 42.3
++      ret = ret + 33
++    case "oop"
++      ret = ret + 44
++    case -3.14
++      ret = ret + 55
++    case nil
++      ret = ret - 111
++    case true
++      ret = ret + 66
++    case -2501
++      ret = ret + 77
++    case false
++      ret = ret + 88
++    case 0
++      ret = ret + 99
++    else
++      assert(ret==494)  -- ensure we only get here once
++      ret = -ret;
++  end
++end
++assert(ret==-494)
++
++
++-- testing fallthrough without automatic break
++ret = 0
++for _,x in ipairs(test) do
++  if x == "nil" then x = nil end
++  switch x
++    case 42.3
++      ret = ret + 11
++    case "oop"
++      ret = ret + 22
++    case 33
++      ret = ret + 33
++    case true
++      ret = ret + 44
++    case 0
++      ret = ret + 55
++    case "ack"
++      ret = ret + 66
++    case nil
++      ret = ret - 111
++    case -3.14
++      ret = ret + 77
++    case false
++      ret = ret + 88
++    case -2501
++      ret = ret + 99
++    else
++      ret = ret + 111
++  end
++end
++assert(ret==4690)
++
++
++-- testing fallthrough without automatic break and with `break` keyword
++ret = 0
++for _,x in ipairs(test) do
++  if x == "nil" then x = nil end
++  switch x
++    case "oop"
++      ret = ret + 11
++    case false
++      ret = ret + 22
++      break
++    case 42.3
++      ret = ret + 33
++    case nil
++      ret = ret - 111
++    case true
++      ret = ret + 44
++      break
++    case -3.14
++      ret = ret + 55
++    case "ack"
++      ret = ret + 66
++      break
++    case -2501
++      ret = ret + 77
++    case 33
++      ret = ret + 88
++      break
++    case 0
++      ret = ret + 99
++    else
++      ret = ret + 111
++  end
++end
++assert(ret==1057)
++
++-- testing `continue` keyword with `and break` modifier
++ret = 0
++for _,x in ipairs(test) do
++  if x == "nil" then x = nil end
++  switch and break on x
++    case 33
++      ret = ret + 11
++    case "ack"
++      ret = ret + 22
++      continue
++    case 42.3
++      ret = ret + 33
++    case "oop"
++      ret = ret + 44
++      continue
++    case -3.14
++      ret = ret + 55
++    case nil
++      ret = ret - 111
++    case -2501
++      ret = ret + 66
++      continue
++    case true
++      ret = ret + 77
++    case false
++      ret = ret + 88
++      continue
++    case 0
++      ret = ret + 99
++    else
++      ret = ret + 111
++  end
++end
++assert(ret==869)
++
++
++x = 33
++ret = 0
++-- testing continue/break and nested switch/case
++switch and break on x
++  case "ack"
++    ret = ret - 11
++  case "oop"
++    ret = ret - 22
++  case nil
++    ret = ret - 99
++  case 33.3
++    ret = ret - 33
++  case 33
++    ret = ret + 44
++    continue    -- continues into `false' case
++  case false
++    ret = ret + 55
++    continue    -- continues into else
++  else
++    ret = ret + 66
++    switch tostring(ret)  -- default is fallthrough without explicit break
++      case 40
++        ret = ret - 111
++      case "ack"
++        ret = ret - 222
++      case "165"
++        ret = ret + 333
++      case "oop"
++        if ret == 498 continue  -- skip to `true'
++        ret = ret - 444
++        break
++      case true
++        ret = ret + 555
++        if ret == 1053 break  -- break
++        ret = ret - 777
++      else
++        ret = ret - 999
++    end
++    ret = ret + 181
++end
++assert(ret==1234)
++
++
++-- testing multiple nested switch/case statements, tests all constant types
++x = 42
++ret = 0
++switch and break on x   -- testing INTEGER (Positive)
++  case 33
++    ret = ret - 33
++  case 42
++    jumpto x    -- check if jumpto in case block works
++    ret = ret - 142
++    :|42|:  -- using same label as case block as well
++    ret = ret + 42
++    switch x / 6   -- testing FLOAT (Positive)
++      case "oop"
++        ret = ret - 120
++      case "ack"
++        ret = ret - 110
++      case nil
++        ret = ret - 111
++      case 3.0
++        ret = ret - 104
++      case 7.2
++        ret = ret - 105
++      case 7.0
++        ret = ret + 106 -- will fallthrough `9.9' and `else'
++      case 9.9
++        ret = ret + 108
++        switch and continue on tostring(ret)  -- testing STRING
++          case "meow"
++            ret = ret - 200
++            break
++          case "mix"
++            ret = ret - 230
++            break
++          case "256"
++            jumpto or ignore on tostring(ret)
++            break
++            :|"256"|:   -- numbers must be quoted to be treated as string
++            ret = ret + 250;
++            switch ret == 506   -- testing BOOLEAN
++              case true
++                ret = ret + 333
++                x = "ack oop"
++                switch and break on x  -- testing STRING with space
++                  case "ack"
++                    ret = ret - 411
++                  case "ack oop"
++                    local p = "ack oop"  -- check jump point with space
++                    jumpto p
++                    :|ack|:
++                      ret = ret - 1000
++                      break
++                    :|"0"|:
++                      ret = ret - 1500
++                      break
++                    :|"ack oop"|:   -- string needs to be quoted for spaces
++                      ret = ret + 459
++                      switch and break on -(ret / 32)  -- testing FLOAT (negative)
++                        case -33.3
++                          ret = ret - 1000
++                        case -40.5625
++                          ret = ret + 700
++                          switch math.floor(-ret / 32)  -- testing INTEGER (negative)
++                            case -33
++                              ret = ret - 2000
++                              break
++                            case nil
++                              ret = ret - 1111
++                            case -63
++                              ret = ret + 1333
++                              break
++                            case -100
++                              ret = ret - 3000
++                              break
++                          end
++                        case "0"
++                          ret = ret - 500
++                      end
++                  case "oop"
++                    ret = ret - 466
++                  else
++                    ret = -1
++                end
++                break
++              case false
++                ret = ret - 333
++            end
++            break
++          case 256
++            ret = 0;
++            break;
++          else
++            ret = ret - 280;
++        end
++      else  -- will fallthrough here
++        ret = ret + 2
++    end
++  case "ack"
++    ret = ret - 10
++  case "oop"
++    ret = ret - 20
++  else
++    ret = ret - 1
++end
++assert(ret==3333)
++
++print'OK'
+================================================================================
+--- Lua-5.3w2/test/ifshortcut.lua
++++ Lunia-1.0/test/ifshortcut.lua
+@@ -0,0 +1,205 @@
++-- testing if shortcut syntax
++
++local function errmsg (code, m)
++  local st, msg = load(code)
++  assert(not st and string.find(msg, m))
++end
++
++errmsg([[ if 1 continue ]], "not inside a loop or case block")
++errmsg([[ if 1 break ]], "not inside a loop or case block")
++
++local r = 0
++
++-- return
++---- vargs
++local function ack(x,...)
++    if x > 10 return ...
++    if x < 1 return 42,...
++    return
++end
++assert(ack(5,32,16)==nil)
++assert(ack(-33,true,false,"ack")==42,true,false,"ack")
++assert(ack(42,1,2,3,4)==1,2,3,4)
++
++
++---- tailcall
++local function tail() return 42,33,3.14 end
++
++local function ack(x)
++  if x == 33 return x,tail()
++  if x == 25 return tail()
++  return x
++end
++assert(ack(99)==99,42,33,3.14)
++assert(ack(25)==42,33,3.14)
++assert(ack(77)==77)
++
++
++---- single value
++local function ack(x)
++    if x > 10 return 10
++    if x < 1 return 1
++    return x
++end
++assert(ack(5)==5)
++assert(ack(-33)==1)
++assert(ack(42)==10)
++
++
++---- multiple values
++local function ack(x,y,z)
++    if x > 10 return y,10,z,6,x
++    if x < 1 return z,y,x
++    return x,y,z
++end
++assert(ack(5,6,7)==5,6,7)
++assert(ack(-1,-2,-3)==-3,-2,-1)
++assert(ack(19,18,17)==18,10,17,5,16)
++
++
++-- jumpto w/goto
++ret = 20
++do
++  if ret == 20 goto meow
++  :|"40"|:
++  ret = ret + 10
++  ::meow::
++  ret = ret + 20
++  if ret == 40 jumpto tostring(ret)
++  ret = ret + 30
++end
++assert(ret==100)
++
++
++-- goto
++ret = 10
++do
++  ret = ret + 10
++  if (ret == 10) goto one
++
++  ::two:: do
++    ret = ret + 30
++    if (ret == 60) goto done
++  end
++
++  ::one::
++  ret = ret + 20
++  if (ret == 20) goto two
++
++  ::done::
++  ret = ret + 30
++end
++assert(ret==100)
++
++
++-- break
++---- fornum
++for i=1,10 do
++	if (i == 6) break
++	r = r + 1
++end
++assert(r==5)
++
++---- forlist
++r = 0
++for _,i in ipairs({ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }) do
++	if (i == 5) break
++	r = r + i
++end
++assert(r==10)
++
++---- while
++r = 0
++i = 0
++while (i < 10) do
++	i = i + 1
++	if (i == 6) break
++  r = r + 1
++end
++assert(r==5)
++ 
++---- repeat
++r = 0
++i = 10
++repeat
++	i = i - 1
++	if (i == 4) break
++	r = r + 1
++until (i < 0)
++assert(r==5)
++
++
++-- switch/case
++r = 33
++i = 0
++switch and break on r
++  case 33
++    i = i + 1
++    continue
++  case 55
++    i = i + 2
++    if i == 3 continue
++    i = i + 55
++  case 99
++    i = i + 9
++  else
++    error("should not be here")
++end
++assert(i==12)
++
++
++-- continue
++---- fornum
++r = 0
++for i=1,10 do
++	if (i % 2 == 0) continue
++	r = r + 1
++end
++assert(r==5)
++
++---- forlist
++r = 0
++for _,i in ipairs({ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 }) do
++	if (i % 2 == 0) continue
++	r = r + i
++end
++assert(r==25)
++
++---- while
++r = 0
++i = 0
++while (i < 10) do
++	i = i + 1
++	if (i % 2 == 1) continue
++  r = r + 1
++end
++assert(r==5)
++ 
++---- repeat
++r = 0
++i = 10
++repeat
++	i = i - 1
++	if (i % 2 == 1) continue
++	r = r + 1
++until (i < 0)
++assert(r==5)
++
++-- switch/case
++r = 0
++i = -42
++switch i
++  case "first"
++    r = r + 11
++  case -42
++    r = r + 22
++  case "last"
++    if r == 22 break
++    r = r + 33
++  else
++    r = r + 44
++end
++assert(r==22)
++
++
++print('OK')
+================================================================================
