@@ -1,9 +1,10 @@
 ================================================================================
- Patch: Jump Tables + Switch Case + Jumpto + If Shortcut + Continue Loops
+Patch:  Jump Tables + Switch Case + Jumpto + If Shortcut + Continue Loops
 Source: Lua 5.3 work 2
-  Date: 2014-05-04 (Sun 04 May 2014)
-Author: Paige Marie DePol [FizzyPop Studios]
+Revisn: 2378 (Tue, 24 Jun 2014)
+Author: Paige Marie DePol
 Online: http://lunia.fizzypopstudios.com
+(c)2014 FizzyPop Studios - See end of file for Open Source License Agreement
 
 Adds block level jump tables to prototypes; jump point locations are indexed
 in the block jump table with jump conditions as keys and PC offsets as values.
@@ -16,13 +17,17 @@ Adds jumpto labels (:|...|:) which can be almost any constant value, sorry no
 NaN or -0.0. Ambiguous strings and strings with spaces must be quoted to be
 recognised as a string;  :|"42"|:  :|"nil"|:  :|"1.25"|:  :|"meow mix"|:
 
-~~~~~~~~~~~~ THE FOLLOWING PATCHES HAVE BEEN MERGED INTO THIS PATCH ~~~~~~~~~~~~
- Patch: If Shortcut Statement
+NOTE: The switch construct may only use literal values for case statements as
+Lua does not have symbolic constants. This issue can be resolved by using the
+`token storage' patch along with the `enum, const, macro, and inline' patch.
+
+~~~~~~~ THE FOLLOWING FEATURES WILL BE EXTRACTED INTO SEPARATE PATCHES ~~~~~~~~
+Patch:  If Shortcut Statement
 Added shortcut IF statements for jumpto/goto/break/continue/return statements
 You may now enter one of the previous statements instead of `then` after `if`
 When this shortcut is used you may not use `else`, and no `end` is required.
 
- Patch: Continue Loop Control
+Patch:  Continue Loop Control
 Added new `continue` statement in loop contexts to allow continuation of next
 loop cycle by jumping to the end of the current syntax block, but not out of it.
 ================================================================================
@@ -622,6 +627,20 @@ loop cycle by jumping to the end of the current syntax block, but not out of it.
          dojump(ci, i, 0);
        )
 ================================================================================
+--- Lua-5.3w2/src/lvm.h	
++++ Lunia-1.0/src/lvm.h	
+@@ -26,6 +26,10 @@
+ 
+ #define luaV_rawequalobj(t1,t2)		luaV_equalobj(NULL,t1,t2)
+ 
++/* checks whether a float has a value representable as a lua_Integer
++   (and does the conversion if so) */
++#define numisinteger(x,i) \
++	(((x) == l_floor(x)) && luaV_numtointeger(x, i))
+ 
+ LUAI_FUNC int luaV_equalobj (lua_State *L, const TValue *t1, const TValue *t2);
+ LUAI_FUNC int luaV_lessthan (lua_State *L, const TValue *l, const TValue *r);
+================================================================================
 --- Lua-5.3w2/src/ltable.c	
 +++ Lunia-1.0/src/ltable.c	
 @@ -67,12 +67,6 @@
@@ -637,20 +656,6 @@ loop cycle by jumping to the end of the current syntax block, but not out of it.
  #define dummynode		(&dummynode_)
  
  #define isdummy(n)		((n) == dummynode)
-================================================================================
---- Lua-5.3w2/src/lvm.h	
-+++ Lunia-1.0/src/lvm.h	
-@@ -26,6 +26,10 @@
- 
- #define luaV_rawequalobj(t1,t2)		luaV_equalobj(NULL,t1,t2)
- 
-+/* checks whether a float has a value representable as a lua_Integer
-+   (and does the conversion if so) */
-+#define numisinteger(x,i) \
-+	(((x) == l_floor(x)) && luaV_numtointeger(x, i))
- 
- LUAI_FUNC int luaV_equalobj (lua_State *L, const TValue *t1, const TValue *t2);
- LUAI_FUNC int luaV_lessthan (lua_State *L, const TValue *l, const TValue *r);
 ================================================================================
 --- Lua-5.3w2/src/llex.c	
 +++ Lunia-1.0/src/llex.c	
@@ -1190,14 +1195,14 @@ loop cycle by jumping to the end of the current syntax block, but not out of it.
  static void whilestat (LexState *ls, int line) {
    /* whilestat -> WHILE cond DO block END */
    FuncState *fs = ls->fs;
-@@ -1243,6 +1463,7 @@
-   whileinit = luaK_getlabel(fs);
-   condexit = cond(ls);
+@@ -1245,6 +1465,7 @@
    enterblock(fs, &bl, 1);
-+  continuelabel(ls);  /* close pending continue */
    checknext(ls, TK_DO);
    block(ls);
++  continuelabel(ls);  /* close pending continue */
    luaK_jumpto(fs, whileinit);
+   check_match(ls, TK_END, TK_WHILE, line);
+   leaveblock(fs);
 @@ -1263,6 +1484,7 @@
    luaX_next(ls);  /* skip REPEAT */
    statlist(ls);
@@ -1238,7 +1243,7 @@ loop cycle by jumping to the end of the current syntax block, but not out of it.
    /* test_then_block -> [IF | ELSEIF] cond THEN block */
    BlockCnt bl;
    FuncState *fs = ls->fs;
-@@ -1382,30 +1620,52 @@
+@@ -1382,30 +1620,53 @@
    int jf;  /* instruction to skip 'then' code (if condition is false) */
    luaX_next(ls);  /* skip IF or ELSEIF */
    expr(ls, &v);  /* read condition */
@@ -1252,7 +1257,8 @@ loop cycle by jumping to the end of the current syntax block, but not out of it.
 -      leaveblock(fs);
 -      return;  /* and that is it */
 +  if (testnext(ls, TK_THEN)) {  /* standard if/then statement */
-+    if (ls->t.token == TK_GOTO || ls->t.token == TK_BREAK) {
++    if (ls->t.token == TK_GOTO || ls->t.token == TK_BREAK ||
++                                  ls->t.token == TK_CONTINUE) {
 +      luaK_goiffalse(ls->fs, &v);  /* will jump to label if condition is true */
 +      enterblock(fs, &bl, 0);  /* must enter block before 'goto' */
 +      gotostat(ls, v.t);  /* handle goto/break */
@@ -1314,7 +1320,7 @@ loop cycle by jumping to the end of the current syntax block, but not out of it.
  }
  
  
-@@ -1413,13 +1673,14 @@
+@@ -1413,13 +1674,14 @@
    /* ifstat -> IF cond THEN block {ELSEIF cond THEN block} [ELSE block] END */
    FuncState *fs = ls->fs;
    int escapelist = NO_JUMP;  /* exit list for finished parts */
@@ -1336,7 +1342,7 @@ loop cycle by jumping to the end of the current syntax block, but not out of it.
  }
  
  
-@@ -1496,36 +1757,116 @@
+@@ -1496,36 +1758,116 @@
  }
  
  
@@ -1479,7 +1485,7 @@ loop cycle by jumping to the end of the current syntax block, but not out of it.
  }
  
  
-@@ -1541,6 +1882,18 @@
+@@ -1541,6 +1883,18 @@
        ifstat(ls, line);
        break;
      }
@@ -1498,7 +1504,7 @@ loop cycle by jumping to the end of the current syntax block, but not out of it.
      case TK_WHILE: {  /* stat -> whilestat */
        whilestat(ls, line);
        break;
-@@ -1571,6 +1924,16 @@
+@@ -1571,6 +1925,16 @@
          localstat(ls);
        break;
      }
@@ -1515,7 +1521,7 @@ loop cycle by jumping to the end of the current syntax block, but not out of it.
      case TK_DBCOLON: {  /* stat -> label */
        luaX_next(ls);  /* skip double colon */
        labelstat(ls, str_checkname(ls), line);
-@@ -1581,7 +1944,8 @@
+@@ -1581,7 +1945,8 @@
        retstat(ls);
        break;
      }
@@ -1525,7 +1531,7 @@ loop cycle by jumping to the end of the current syntax block, but not out of it.
      case TK_GOTO: {  /* stat -> 'goto' NAME */
        gotostat(ls, luaK_jump(ls->fs));
        break;
-@@ -1633,12 +1997,13 @@
+@@ -1633,12 +1998,13 @@
    luaC_objbarrier(L, funcstate.f, funcstate.f->source);
    lexstate.buff = buff;
    lexstate.dyd = dyd;
@@ -1868,4 +1874,23 @@ loop cycle by jumping to the end of the current syntax block, but not out of it.
  LUAI_FUNC int luaK_jump (FuncState *fs);
  LUAI_FUNC void luaK_ret (FuncState *fs, int first, int nret);
  LUAI_FUNC void luaK_patchlist (FuncState *fs, int list, int target);
+================================================================================  
+Copyright (c)2014 FizzyPop Studios
+
+Permission is hereby granted, free of charge, to any person obtaining a copy of
+this patch file and any associated documentation (the "Software"), to deal in
+the Software without restriction, including without limitation the rights to
+use, copy, modify, merge, publish, distribute, sublicense, and/or sell copies
+of the Software, and to permit persons to whom the Software is furnished to do
+so, subject to the following conditions:
+        
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR
+COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER
+IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN
+CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 ================================================================================
