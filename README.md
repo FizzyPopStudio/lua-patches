@@ -14,6 +14,6 @@ Each patch contains a copy of the License Agreement at the end of the file.
 This table will be updated whenever new patches are released and/or updated.
 Patches will be sorted with the most recent changes at the top of the table.
 
-|Patch                                            | Rev   | Date              |
-|-------------------------------------------------|-------|-------------------|
-| joint ~ jump-table+if-shortcut+continue-loop    | 2399  | Fri 27 Jun 2014   |
+|Patch  | Rev   | Date  |
+|-------|-------|-------|
+| [joint ~ jump-table+if-shortcut+continue-loop](https://github.com/FizzyPop/lua-patches/blob/master/joint-patches/jump-table%2Bif-shct%2Bcont-loop)  | 2399  | Fri 27 Jun 2014 |
