@@ -12,6 +12,7 @@ Each patch contains a copy of the License Agreement at the end of the file.
 ##Release Status
 
 This table will be updated whenever new patches are released and/or updated.
+
 Patches will be sorted with the most recent changes at the top of the table.
 
 |Patch  | Rev   | Date  |
