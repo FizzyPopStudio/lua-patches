@@ -1,7 +1,7 @@
 ================================================================================
 Patch:  Jump Tables + Switch Case + Jumpto + If Shortcut + Continue Loops
 Source: Lua 5.3 work 2
-Revisn: 2378 (Tue, 24 Jun 2014)
+Revisn: 2399 (Fri, 27 Jun 2014)
 Author: Paige Marie DePol
 Online: http://lunia.fizzypopstudios.com
 (c)2014 FizzyPop Studios - See end of file for Open Source License Agreement
