@@ -1,4 +1,4 @@
-##lua-patches
+##Lua Patches
 
 All patches under these directories require Lua 5.3 work 2
 
@@ -14,6 +14,6 @@ Each patch contains a copy of the License Agreement at the end of the file.
 This table will be updated whenever new patches are released and/or updated.
 Patches will be sorted with the most recent changes at the top of the table.
 
-|Patch                                    | Rev   | Date              |
-|-----------------------------------------|-------|-------------------|
-| joint ~ jump-table+if-shct+cont-loop    | 2399  | Fri 27 Jun 2014   |
+|Patch                                            | Rev   | Date              |
+|-------------------------------------------------|-------|-------------------|
+| joint ~ jump-table+if-shortcut+continue-loop    | 2399  | Fri 27 Jun 2014   |
