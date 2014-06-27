@@ -1,4 +1,4 @@
-##joint-patches
+##Joint Patches
 
 Multiple clean patches integerated into a single patch
 
