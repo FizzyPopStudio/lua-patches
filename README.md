@@ -2,17 +2,17 @@
 
 All patches under these directories require Lua 5.3 work 2
 
+**clean-patches:** Individual patches to apply to a clean Lua codebase
 
-##clean-patches
+**joint-patches:** Multiple clean patches integrated into a single patch
 
-Power Patches to be applied to a clean Lua codebase
-
-
-##joint-patches
-
-These patches are two or more clean Power Patches merged together due to conflicts between them
+Each patch contains the License Agreement at the end of the file.
 
 
-##License
+##Release Status
 
-All patches under this directory use the license in the LICENSE file
+This table will be updated whenever new patches are released and/or updated
+
+|Patch                                    | Rev   | Date              |
+|-----------------------------------------|-------|-------------------|
+| joint ~ jump-table+if-shct+cont-loop    | 2399  | Fri, 27 Jun 2014  |
