@@ -19,6 +19,13 @@ This patch also adds a new shortcut form of the `if` statement, created for easi
 Also, this patch adds the `continue` keyword for loop control, it works as you probably expect it to.
 
 
+### Limitations
+
+As Lua does not have support for symbolic constants all case values in the `switch` statement must be literal constants. This leads to lower quality code due to the use of magic numbers. A solution is available by using my "Token Storage" patch along with my "Enum, Const, Macro, and Inline" patch.
+
+**This patch is still under development, however, it is nearly complete, so check back soon!**
+
+
 ###Jumpto (Computed Goto)
 
 A jumpto statement has the following syntax:
